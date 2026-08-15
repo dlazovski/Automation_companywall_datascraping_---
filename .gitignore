@@ -1,0 +1,9 @@
+node_modules/
+
+# Scraped HTML is third-party business data — keep it local.
+tests/fixtures/*
+!tests/fixtures/README.md
+
+# Never commit exported workflows containing real credential ids.
+*.local.json
+.env

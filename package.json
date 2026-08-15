@@ -1,0 +1,17 @@
+{
+  "name": "companywall-mk-scraper",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "n8n workflows that scrape CompanyWall.mk (Southeast + East regions, 1-5 employees, all industries) via ScrapingBee into Google Sheets.",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node scripts/test-parsers.mjs",
+    "validate": "node scripts/validate.mjs",
+    "simulate": "node scripts/simulate.mjs",
+    "check": "npm run build && npm test && npm run validate && npm run simulate"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
