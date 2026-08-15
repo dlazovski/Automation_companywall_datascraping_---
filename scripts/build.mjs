@@ -393,9 +393,11 @@ const to   = Number(cfg.employeesTo);
 // One search per (town x headcount). Both axes partition cleanly — a company
 // sits in exactly one town and has exactly one headcount — so the slices never
 // overlap, and their union is the whole region.
-const towns = (Array.isArray(cfg.towns) && cfg.towns.length)
-  ? cfg.towns
-  : [{ code: '', name: '' }]; // no town list -> whole region, as before
+// A town with no code would search the whole region and blow past the ceiling,
+// so blanks are dropped rather than silently widening the search.
+let towns = (Array.isArray(cfg.towns) ? cfg.towns : [])
+  .filter(t => t && String(t.code || '').trim());
+if (!towns.length) towns = [{ code: '', name: '', region: cfg.region }];
 
 const heads = [];
 if (cfg.splitByEmployeeCount !== false) {
@@ -404,14 +406,19 @@ if (cfg.splitByEmployeeCount !== false) {
   heads.push({ from: from, to: to });
 }
 
+// Each town carries its own region, so a single run can span both — the towns
+// of interest are split across Southeast and East.
 const slices = [];
 towns.forEach(t => {
+  const reg = t.region || cfg.region;
   heads.forEach(h => {
     const head = h.from === h.to ? h.from + ' employees' : h.from + '-' + h.to + ' employees';
     slices.push({
       from: h.from,
       to: h.to,
       town: t.code || '',
+      regionCode: reg.code,
+      regionName: reg.name,
       label: (t.name ? t.name + ', ' : '') + head
     });
   });
@@ -444,10 +451,17 @@ const slice = st.slices[st.sliceIdx];
 // so one town per run works without touching Seed State.
 const town = slice.town || cfg.townCode || '';
 
+// The slice's own region wins. Writing it back into the item is what lets
+// Parse Search Page tag companies per town without any change of its own.
+const regionCode = slice.regionCode != null ? slice.regionCode : st.regionCode;
+const regionName = slice.regionName || st.regionName;
+
 return {
   json: Object.assign({}, st, {
+    regionCode,
+    regionName,
     sliceLabel: slice.label + (town && !slice.town ? ' (town ' + town + ')' : ''),
-    targetUrl: buildSearchUrl(st.regionCode, st.page, slice.from, slice.to, town)
+    targetUrl: buildSearchUrl(regionCode, st.page, slice.from, slice.to, town)
   })
 };
 `, { forEach: true }),
