@@ -481,7 +481,8 @@ $('Read Existing Sheet').all()
     if (e) byEdb[e] = r; // never index on an empty ЕДБ — they would all collide
   });
 
-const DETAIL_COLS = ['Phones', 'Emails', 'Owners', 'Managers', 'NKD Code', 'NKD Description', 'Date Founded'];
+// A cell is "blank" only when it holds nothing. A real 0 (revenue) is a value.
+const isBlank = v => v === '' || v === null || v === undefined;
 
 return dedupeCompanies(st.companies || []).map(c => {
   const prev = byUrl[c.profileUrl] || (c.edb ? byEdb[c.edb] : null);
@@ -510,10 +511,19 @@ return dedupeCompanies(st.companies || []).map(c => {
     cfg.multiValueSeparator
   );
 
-  // Carry forward detail already gathered by an earlier run, otherwise this
-  // write would blank those cells before the detail pass refills them.
+  // Never blank a cell that already holds something.
+  //
+  // This pass only sees the search-results fields, so every column the DETAIL
+  // pass fills — phones, emails, owners, managers, NKD, date founded, and ЕМБС,
+  // which appears on the profile page but not in search results — would
+  // otherwise be overwritten with an empty string on every subsequent run.
+  // A blanket rule is used rather than a list of column names so that adding a
+  // column later cannot silently reintroduce the bug. Fresh non-empty values
+  // still win, so genuinely updated data is not held back.
   if (prev) {
-    DETAIL_COLS.forEach(k => { if (prev[k]) row[k] = prev[k]; });
+    Object.keys(row).forEach(k => {
+      if (isBlank(row[k]) && !isBlank(prev[k])) row[k] = prev[k];
+    });
     if (alreadyDetailed) row['Detail Fetched'] = 'yes';
   }
   return { json: row };

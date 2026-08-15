@@ -282,6 +282,14 @@ const r2both = run2.sheet.find(r => r['Tax Number (EDB)'] === '4029000000004');
 eq('R2: cross-region company records BOTH regions', r2both['Region'], 'Southeast + East');
 eq('R2: its run-1 detail is preserved, not blanked', r2both['Owners'], 'Марко Марковски (100,00%)');
 eq('R2: its run-1 phones preserved', r2both['Phones'], '032/391-100; 070 111 222');
+// ЕМБС comes from the PROFILE page, not the search results, so a later run
+// re-writing list fields must not blank it. Same for every other column that
+// only the detail pass can fill.
+eq('R2: EMBS from run 1 preserved', r2both['Registration Number (EMBS)'], '7000001');
+eq('R2: NKD preserved', r2both['NKD Code'], '47.910');
+eq('R2: date founded preserved', r2both['Date Founded'], '12.05.2016');
+eq('R2: no column silently blanked',
+  Object.keys(r2both).filter(k => r2both[k] === '' && k !== 'Notes'), []);
 eq('R2: still marked enriched', r2both['Detail Fetched'], 'yes');
 
 const r2beta = run2.sheet.find(r => r['Tax Number (EDB)'] === '4029000000002');
