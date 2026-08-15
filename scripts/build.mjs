@@ -1,8 +1,13 @@
 /**
- * Generates the importable n8n workflow JSON files from lib/parsers.js.
+ * Generates workflows/companywall-scraper.json from lib/parsers.js.
+ *
+ * One workflow, run once per region: set `region` in the Config node, execute,
+ * then change it and execute again. The second run reads the sheet back first,
+ * so a company found in both regions updates its existing row (Region becomes
+ * "Southeast + East") instead of being written twice or re-scraped.
  *
  * Why generated rather than hand-written: the parser logic must live in exactly
- * one place. After Step 0 you will tune selectors in lib/parsers.js, run
+ * one place. After a trial run you will tune selectors in lib/parsers.js, run
  * `npm run build`, and re-import — no copy-paste drift across Code nodes.
  *
  * Usage: node scripts/build.mjs
@@ -217,9 +222,13 @@ function sheetsRead(name, pos) {
     type: 'n8n-nodes-base.googleSheets',
     typeVersion: 4.5,
     position: pos,
+    // A sheet holding only headers returns zero items, which would stall the
+    // whole workflow. Always emit one (empty) item so the crawl still starts.
+    alwaysOutputData: true,
     credentials: {
       googleSheetsOAuth2Api: { id: 'REPLACE_WITH_GOOGLE_SHEETS_CREDENTIAL_ID', name: 'Google Sheets account' }
-    }
+    },
+    notes: 'Reads rows written by previous runs, so run 2 can merge regions and skip already-enriched companies.'
   };
 }
 
@@ -267,28 +276,45 @@ function workflow(name, nodes, edges) {
   };
 }
 
-/* ------------------------------------------------------------------ *
- * Shared Config node body
- * ------------------------------------------------------------------ */
+
+/* ================================================================== *
+ * Config — the only node you edit between runs
+ * ================================================================== */
 
 const CONFIG_BODY = `
-// ---- EDIT THESE TWO BEFORE RUNNING -------------------------------------
-const googleSheetId = 'PUT_YOUR_GOOGLE_SHEET_ID_HERE'; // from the sheet URL: /spreadsheets/d/<THIS>/edit
-const sheetName     = 'Companies';                     // tab name inside that spreadsheet
-// -----------------------------------------------------------------------
+// ===== 1. SET THE REGION FOR THIS RUN =====================================
+// Run 1 — Југоисточен регион (Southeast): { code: 7, name: 'Southeast' }
+// Run 2 — Источен регион     (East):      { code: 2, name: 'East' }
+//
+// Change this line, save, execute again. The workflow reads the sheet back at
+// the start of every run, so run 2 updates rows run 1 already wrote rather than
+// duplicating them — a company found in both regions ends up with
+// Region = "Southeast + East" and is not scraped twice.
+const region = { code: 7, name: 'Southeast' };
+
+// ===== 2. SET YOUR SHEET ==================================================
+const googleSheetId = 'PUT_YOUR_GOOGLE_SHEET_ID_HERE'; // /spreadsheets/d/<THIS>/edit
+const sheetName     = 'Companies';                     // tab name
+
+// ===== 3. RUN SIZE ========================================================
+// TRIAL RUN (do this first, before either full run):
+//     maxPages: 1, maxCompanies: 3
+//   -> 1 search page + 3 companies = 7 requests. Check the sheet and the
+//      Run Summary node, tune lib/parsers.js if anything is wrong.
+// FULL RUN:
+//     maxPages: 300, maxCompanies: 0
+const maxPages     = 300; // safety stop for the pagination loop
+const maxCompanies = 0;   // 0 = every company found; otherwise cap the detail pass
+const fetchDetails = true; // false = list fields only, no profile/lica requests
 
 return [{
   json: {
+    region,
     googleSheetId,
     sheetName,
-
-    // Southeast + East. These two cover Штип, Радовиш, Струмица, Валандово,
-    // Богданци, Дојран, Гевгелија, Пробиштип, Кочани, Виница,
-    // Македонска Каменица, Делчево, Берово.
-    regions: [
-      { code: 7, name: 'Southeast' },
-      { code: 2, name: 'East' }
-    ],
+    maxPages,
+    maxCompanies,
+    fetchDetails,
 
     employeesFrom: 1,
     employeesTo: 5,
@@ -296,232 +322,62 @@ return [{
     // Rate limiting. CompanyWall asks not to send many search requests at once
     // ("Не испраќајте премногу барања за пребарување одеднаш").
     // Every outbound request is preceded by a Wait of this many seconds, and the
-    // workflow is strictly single-threaded (one in-flight request at a time).
+    // workflow keeps exactly one request in flight at a time.
     waitSeconds: 4,
 
-    // Runaway guards.
-    maxPages: 300,          // per region
-    maxCompaniesPhase2: 0,  // 0 = no limit; set e.g. 100 for a trial run
-
-    // ScrapingBee options. The search and profile pages are plain server-rendered
-    // HTML, so render_js is not needed. Turn premiumProxy on only if Step 0
-    // reports CLOUDFLARE_CHALLENGE / CAPTCHA (it costs far more credits).
+    // ScrapingBee. The search and profile pages are plain server-rendered HTML,
+    // so render_js is not needed. Turn premiumProxy on only if the Run Summary
+    // reports CLOUDFLARE_CHALLENGE / CAPTCHA — it costs far more credits.
     renderJs: false,
     premiumProxy: false,
 
-    // How multi-value fields (phones, emails, owners, managers) are written.
-    // Single cell, values joined by this separator.
+    // Phones, emails, owners and managers go into one cell each, joined by this.
     multiValueSeparator: '; '
   }
 }];
 `;
 
 /* ================================================================== *
- * Workflow 00 — Step 0 recon
+ * The workflow
  * ================================================================== */
 
-function buildRecon() {
+function buildWorkflow() {
   const nodes = [
-    manualTrigger('When clicking Execute', [-660, 300]),
-    codeNode('Config', [-440, 300], CONFIG_BODY),
-    codeNode('Recon Targets', [-220, 300], `
-// Four probes: both region searches, one known-good profile, and its /lica page.
-// The profile below is the one confirmed live in the task brief.
-const cfg = $('Config').first().json;
-const sample = '/kompanija/%D0%B1-%D1%82%D0%B5%D1%86%D1%85%D0%BD%D0%BE%D0%BB%D0%BE%D1%9F%D0%B8-%D0%B4%D0%BE%D0%BE%D0%B5%D0%BB-%D1%81%D0%BA%D0%BE%D0%BF%D1%98%D0%B5/MMxL2jxY';
-
-const targets = [];
-cfg.regions.forEach(r => {
-  targets.push({
-    kind: 'search',
-    label: 'Search page 1 — ' + r.name + ' (r=' + r.code + ')',
-    targetUrl: buildSearchUrl(r.code, 1, cfg.employeesFrom, cfg.employeesTo)
-  });
-});
-targets.push({ kind: 'profile', label: 'Sample company profile', targetUrl: CW_BASE + sample });
-targets.push({ kind: 'lica',    label: 'Sample company /lica',   targetUrl: CW_BASE + sample + '/lica' });
-
-return targets.map(t => ({ json: t }));
-`),
-    splitInBatches('Loop Probes', [0, 300], 1),
-    waitNode('Rate Limit Wait', [220, 420]),
-    scrapingBee('Fetch (ScrapingBee)', [440, 420], '={{ $json.targetUrl }}'),
-    codeNode('Diagnose', [660, 420], `
-// Runs the real parsers against the real HTML and reports what they found.
-// This is the whole point of Step 0: if the numbers below look wrong, tune
-// lib/parsers.js (not the workflow) and re-run.
-const probe = $('Loop Probes').item.json;
-const resp  = $input.item.json;
-
-const statusCode = resp.statusCode == null ? 0 : resp.statusCode;
-const html = String(resp.body == null ? (resp.data == null ? '' : resp.data) : resp.body);
-
-const out = {
-  label: probe.label,
-  kind: probe.kind,
-  targetUrl: probe.targetUrl,
-  statusCode,
-  htmlLength: html.length,
-  healthFlags: diagnoseResponse(html).join(', ') || 'none'
-};
-
-if (statusCode >= 400 || !html) {
-  out.ERROR = 'Non-OK response — check ScrapingBee credential, credits, and whether premium_proxy is needed.';
-  out.bodyPreview = html.slice(0, 2000);
-  return { json: out };
-}
-
-if (probe.kind === 'search') {
-  const r = parseSearchResults(html);
-  out.anchorsFound   = r.anchorsFound;
-  out.rowsParsed     = r.rows.length;
-  out.rowsWithEdb    = r.rowsWithEdb;
-  out.chunkingMode   = r.mode;
-  out.totalReported  = r.total;
-  out.hasNextPageLink = /[?&]p=2\\b/.test(html);
-  out.firstThreeRows = r.rows.slice(0, 3);
-  out.CHECK = [
-    'rowsParsed should equal the number of companies visible on page 1',
-    'rowsWithEdb should equal rowsParsed (if far lower, row chunking is off)',
-    'firstThreeRows: verify name/status/address/employees/revenue are correct and not shifted between companies'
-  ].join(' | ');
-}
-
-if (probe.kind === 'profile') {
-  const p = parseProfile(html);
-  out.parsed = p;
-  // Does the "show all contacts" toggle hide anything, or is it just a /lica link?
-  const showAll = html.match(/<a[^>]+href\\s*=\\s*["']([^"']+)["'][^>]*>[^<]*Прикажи ги сите[^<]*<\\/a>/i);
-  out.showAllToggleHref = showAll ? showAll[1] : 'not found on page';
-  out.showAllPointsToLica = showAll ? /\\/lica\\/?$/.test(showAll[1]) : null;
-  out.mailtoCount = (html.match(/href\\s*=\\s*["']mailto:/gi) || []).length;
-  out.telCount    = (html.match(/href\\s*=\\s*["']tel:/gi) || []).length;
-  out.CHECK = [
-    'phones/emails should contain EVERY value shown on the page, not just the first',
-    'if mailtoCount > emails.length, the extra addresses are lazy-loaded and need render_js',
-    'if showAllPointsToLica is true, the toggle is just a mislabelled link — no hidden contacts'
-  ].join(' | ');
-}
-
-if (probe.kind === 'lica') {
-  const l = parseLica(html);
-  out.ownersFound   = l.owners.length;
-  out.managersFound = l.managers.length;
-  out.owners        = l.owners;
-  out.managers      = l.managers;
-  out.rawAnchorCounts = {
-    'Претставник': (html.match(/Претставник/g) || []).length,
-    'Сопственик':  (html.match(/Сопственик/g) || []).length
-  };
-  out.CHECK = 'ownersFound + managersFound should match rawAnchorCounts (minus any label occurring in page chrome)';
-}
-
-return { json: out };
-`, { forEach: true }),
-    codeNode('Recon Report', [220, 180], `
-// Runs once, after all four probes.
-const rows = $input.all().map(i => i.json);
-const problems = [];
-
-rows.forEach(r => {
-  if (r.ERROR) problems.push(r.label + ': ' + r.ERROR);
-  if (r.healthFlags && r.healthFlags !== 'none' && !/BONITET/.test(r.healthFlags)) {
-    problems.push(r.label + ': health flags -> ' + r.healthFlags);
-  }
-  if (r.kind === 'search' && !r.rowsParsed) problems.push(r.label + ': parsed ZERO rows — selectors need tuning');
-  if (r.kind === 'lica' && !r.ownersFound && !r.managersFound) problems.push(r.label + ': parsed ZERO people — selectors need tuning');
-});
-
-const searches = rows.filter(r => r.kind === 'search');
-const perPage = searches.length && searches[0].rowsParsed ? searches[0].rowsParsed : 0;
-
-return [{
-  json: {
-    verdict: problems.length ? 'NEEDS ATTENTION' : 'LOOKS GOOD — safe to run Phase 1',
-    problems: problems.length ? problems : ['none'],
-    resultsPerPage: perPage || 'unknown',
-    reportedTotals: searches.map(s => s.label + ': ' + (s.totalReported == null ? 'not detected' : s.totalReported)),
-    estimatedPhase1Requests: searches.map(s => {
-      const t = s.totalReported;
-      return s.label + ': ' + (t && perPage ? Math.ceil(t / perPage) + ' page requests' : 'unknown until first run');
-    }),
-    note: 'Phase 2 costs 2 requests per company (profile + /lica). Multiply the unique company count by 2 before running it.',
-    probes: rows
-  }
-}];
-`),
-    sticky([
-      '## Step 0 — run this FIRST',
-      '',
-      'Four probes through ScrapingBee: both region searches, one company profile, and that same company’s `/lica` page.',
-      '',
-      '**Read the `Recon Report` output**, not just the green ticks:',
-      '- `verdict` — go / no-go',
-      '- `resultsPerPage` + `reportedTotals` — tells you how big this run really is',
-      '- each probe’s `CHECK` field lists exactly what to eyeball',
-      '',
-      'If parsing is off, fix `lib/parsers.js`, run `npm run build`, re-import.',
-      'Do not edit the Code nodes in n8n — they are generated.'
-    ].join('\n'), [-660, -60], [520, 320], 3)
-  ];
-
-  const edges = [
-    ['When clicking Execute', 'Config'],
-    ['Config', 'Recon Targets'],
-    ['Recon Targets', 'Loop Probes'],
-    ['Loop Probes', 'Recon Report', 0],   // done branch
-    ['Loop Probes', 'Rate Limit Wait', 1], // loop branch
-    ['Rate Limit Wait', 'Fetch (ScrapingBee)'],
-    ['Fetch (ScrapingBee)', 'Diagnose'],
-    ['Diagnose', 'Loop Probes']
-  ];
-
-  return workflow('CompanyWall — 00 Step 0 Recon', nodes, edges);
-}
-
-/* ================================================================== *
- * Workflow 01 — Phase 1: paginate both regions, write list fields
- * ================================================================== */
-
-function buildPhase1() {
-  const nodes = [
-    manualTrigger('When clicking Execute', [-880, 300]),
-    codeNode('Config', [-660, 300], CONFIG_BODY),
-    codeNode('Seed State', [-440, 300], `
-// ONE item carries the whole crawl. Regions are worked through sequentially via
-// a queue rather than as parallel items, which guarantees exactly one in-flight
-// request at a time and makes the "all regions finished" branch fire exactly once.
+    manualTrigger('When clicking Execute', [-1120, 300]),
+    codeNode('Config', [-900, 300], CONFIG_BODY),
+    sheetsRead('Read Existing Sheet', [-680, 300]),
+    codeNode('Seed State', [-460, 300], `
+// Seeds the pagination crawl for the single region set in Config.
+// Previously-written rows are NOT copied into this item — the crawl state is
+// carried through every loop iteration, so it is kept small. Prepare Companies
+// reads them straight from $('Read Existing Sheet') instead.
 const cfg = $('Config').first().json;
 
 return [{
   json: {
-    queue: cfg.regions,
-    idx: 0,
+    regionCode: cfg.region.code,
+    regionName: cfg.region.name,
     page: 1,
     companies: [],
     seen: [],
-    perRegion: [],
     errors: [],
     pagesFetched: 0
   }
 }];
 `),
-    codeNode('Build Search URL', [-220, 300], `
+    codeNode('Build Search URL', [-240, 300], `
 const cfg = $('Config').first().json;
 const st  = $input.item.json;
-const region = st.queue[st.idx];
 
 return {
   json: Object.assign({}, st, {
-    regionCode: region.code,
-    regionName: region.name,
-    targetUrl: buildSearchUrl(region.code, st.page, cfg.employeesFrom, cfg.employeesTo)
+    targetUrl: buildSearchUrl(st.regionCode, st.page, cfg.employeesFrom, cfg.employeesTo)
   })
 };
 `, { forEach: true }),
-    waitNode('Rate Limit Wait', [0, 300]),
-    scrapingBee('Fetch Search Page', [220, 300], '={{ $json.targetUrl }}'),
-    codeNode('Parse Search Page', [440, 300], `
+    waitNode('Wait Before Search', [-20, 300]),
+    scrapingBee('Fetch Search Page', [200, 300], '={{ $json.targetUrl }}'),
+    codeNode('Parse Search Page', [420, 300], `
 const cfg  = $('Config').first().json;
 const st   = $('Build Search URL').item.json;
 const resp = $input.item.json;
@@ -529,217 +385,146 @@ const resp = $input.item.json;
 const statusCode = resp.statusCode == null ? 0 : resp.statusCode;
 const html = String(resp.body == null ? (resp.data == null ? '' : resp.data) : resp.body);
 
-const errors    = (st.errors || []).slice();
-const perRegion = (st.perRegion || []).slice();
-const seen      = new Set(st.seen || []);
-let companies   = (st.companies || []).slice();
+const errors = (st.errors || []).slice();
+const seen   = new Set(st.seen || []);
+let companies = (st.companies || []).slice();
 
-let stopRegion = false;
-let newRows = 0;
+let stop = false;
 let pageRows = 0;
+let newRows = 0;
+let healthFlags = [];
 
-// Brief is explicit: on 403/429 stop this batch and log it. Do NOT retry in a
-// loop — that is how you get the IP blocked for the rest of the run.
+// The brief is explicit: on 403/429 stop and log. Do NOT retry in a loop —
+// that is how a soft block becomes a hard one.
 if (statusCode === 403 || statusCode === 429) {
-  errors.push('BLOCKED ' + statusCode + ' on ' + st.regionName + ' page ' + st.page + ' — stopping this region. Consider premiumProxy: true or a longer waitSeconds.');
-  stopRegion = true;
+  errors.push('BLOCKED ' + statusCode + ' on page ' + st.page + ' — stopped. Try a higher waitSeconds, or premiumProxy: true.');
+  stop = true;
 } else if (statusCode >= 400 || !html) {
-  errors.push('HTTP ' + statusCode + ' on ' + st.regionName + ' page ' + st.page + ' — stopping this region.');
-  stopRegion = true;
+  errors.push('HTTP ' + statusCode + ' on page ' + st.page + ' — stopped.');
+  stop = true;
 } else {
-  const flags = diagnoseResponse(html);
-  if (flags.indexOf('CLOUDFLARE_CHALLENGE') >= 0 || flags.indexOf('CAPTCHA') >= 0) {
-    errors.push('CHALLENGE on ' + st.regionName + ' page ' + st.page + ' (' + flags.join(',') + ') — stopping this region. Set premiumProxy: true.');
-    stopRegion = true;
+  healthFlags = diagnoseResponse(html);
+  if (healthFlags.indexOf('CLOUDFLARE_CHALLENGE') >= 0 || healthFlags.indexOf('CAPTCHA') >= 0) {
+    errors.push('CHALLENGE on page ' + st.page + ' (' + healthFlags.join(',') + ') — stopped. Set premiumProxy: true.');
+    stop = true;
   } else {
     const parsed = parseSearchResults(html);
     pageRows = parsed.rows.length;
 
-    // "seen" is keyed per region, not globally: a company that legitimately
-    // surfaces in BOTH regions must be collected twice so Dedupe Companies can
-    // merge it and record "Southeast + East". Within a region the key still
-    // detects the site repeating a page, which is our pagination stop signal.
-    const key = r => st.regionCode + '|' + r.profileUrl;
-
-    const fresh = parsed.rows.filter(r => r.profileUrl && !seen.has(key(r)));
+    const fresh = parsed.rows.filter(r => r.profileUrl && !seen.has(r.profileUrl));
     fresh.forEach(r => {
-      seen.add(key(r));
+      seen.add(r.profileUrl);
       r.region = st.regionName;
       r.regionCode = st.regionCode;
-      r.detailFetched = false;
-      r.notes = [];
       companies.push(r);
     });
     newRows = fresh.length;
 
-    // Exhausted when a page yields nothing new (covers both an empty page and
-    // the site clamping pagination by repeating the last page).
-    if (newRows === 0) stopRegion = true;
+    if (parsed.rows.length && !parsed.rowsWithEdb) {
+      errors.push('Page ' + st.page + ': parsed ' + parsed.rows.length + ' rows but none had a ЕДБ — row parsing is probably wrong. Check lib/parsers.js.');
+    }
+
+    // Exhausted when a page brings nothing new. Covers both an empty page and
+    // the site clamping pagination by repeating the last page.
+    if (newRows === 0) stop = true;
     if (st.page >= cfg.maxPages) {
-      errors.push('Hit maxPages (' + cfg.maxPages + ') for ' + st.regionName + ' — results may be truncated.');
-      stopRegion = true;
+      errors.push('Hit maxPages (' + cfg.maxPages + ') — results may be truncated. Raise it if the region is bigger than this.');
+      stop = true;
     }
   }
 }
 
-let idx  = st.idx;
-let page = st.page;
-
-if (stopRegion) {
-  perRegion.push({
-    region: st.regionName,
-    regionCode: st.regionCode,
-    pagesFetched: st.page,
-    companiesFound: companies.filter(c => c.regionCode === st.regionCode).length
-  });
-  idx = st.idx + 1;
-  page = 1;
-} else {
-  page = st.page + 1;
-}
-
-const hasMore = idx < st.queue.length;
-
 return {
   json: {
-    queue: st.queue,
-    idx,
-    page,
+    regionCode: st.regionCode,
+    regionName: st.regionName,
+    page: stop ? st.page : st.page + 1,
     companies,
     seen: Array.from(seen),
-    perRegion,
     errors,
     pagesFetched: (st.pagesFetched || 0) + 1,
-    hasMore,
-    lastPage: { region: st.regionName, page: st.page, rows: pageRows, newRows, statusCode }
+    hasMore: !stop,
+    lastPage: { page: st.page, rows: pageRows, newRows, statusCode, healthFlags }
   }
 };
 `, { forEach: true }),
-    ifNode('More Pages?', [660, 300], '={{ $json.hasMore }}'),
-    codeNode('Dedupe Companies', [900, 200], `
-// Runs once, when every region is exhausted.
+    ifNode('More Pages?', [640, 300], '={{ $json.hasMore }}'),
+    codeNode('Prepare Companies', [880, 420], `
+// Runs once, when the region is fully crawled.
+// Merges this run's findings with whatever a previous run already wrote, so
+// that running the workflow again for the other region tops up the same rows.
 const cfg = $('Config').first().json;
 const st  = $input.first().json;
 
-const unique = dedupeCompanies(st.companies || []);
+const previous = {};
+$('Read Existing Sheet').all()
+  .map(i => i.json)
+  .filter(r => r && r['Profile URL'])
+  .forEach(r => { previous[String(r['Profile URL']).replace(/\\/+$/, '')] = r; });
 
-return unique.map(c => ({
-  json: buildSheetRow(c, cfg.multiValueSeparator)
-}));
-`),
-    sheets('Write List Rows', [1120, 200], { operation: 'append' }),
-    codeNode('Phase 1 Summary', [900, 420], `
-const st = $input.first().json;
-const unique = dedupeCompanies(st.companies || []);
+const DETAIL_COLS = ['Phones', 'Emails', 'Owners', 'Managers', 'NKD Code', 'NKD Description', 'Date Founded'];
 
-const perRegionLines = (st.perRegion || []).map(r =>
-  r.region + ' (r=' + r.regionCode + '): ' + r.companiesFound + ' companies over ' + r.pagesFetched + ' page requests'
-);
+return dedupeCompanies(st.companies || []).map(c => {
+  const prev = previous[c.profileUrl];
 
-const dupes = (st.companies || []).length - unique.length;
-const missingEdb = unique.filter(c => !c.edb).length;
-
-return [{
-  json: {
-    phase: 1,
-    perRegion: perRegionLines,
-    totalRowsCollected: (st.companies || []).length,
-    totalUnique: unique.length,
-    duplicatesRemoved: dupes,
-    rowsMissingEdb: missingEdb,
-    searchPageRequests: st.pagesFetched,
-    errors: (st.errors || []).length ? st.errors : ['none'],
-
-    CHECKPOINT: 'Review the sheet before running Phase 2.',
-    phase2RequestEstimate: (unique.length * 2) + ' ScrapingBee requests (profile + /lica per company)',
-    phase2TimeEstimate: (() => {
-      const secs = unique.length * 2 * 5; // 2 requests x ~(4s wait + ~1s latency)
-      const h = Math.floor(secs / 3600), m = Math.round((secs % 3600) / 60);
-      return h ? h + 'h ' + m + 'm' : m + 'm';
-    })(),
-    phase2Advice: 'To trial it first, set maxCompaniesPhase2 to e.g. 25 in the Phase 2 Config node. Delete rows from the sheet to narrow the list — Phase 2 only enriches rows that are still there.'
+  // A company can legitimately appear in both regions — keep both labels.
+  let region = c.region;
+  if (prev && prev['Region']) {
+    const regions = String(prev['Region']).split(/\\s*\\+\\s*/).map(s => s.trim()).filter(Boolean);
+    if (regions.indexOf(c.region) < 0) regions.push(c.region);
+    region = regions.join(' + ');
   }
-}];
+
+  const alreadyDetailed = !!prev && String(prev['Detail Fetched'] || '').toLowerCase() === 'yes';
+  const row = buildSheetRow(Object.assign({}, c, { region, detailFetched: alreadyDetailed }), cfg.multiValueSeparator);
+
+  // Carry forward detail already gathered by an earlier run, otherwise this
+  // write would blank those cells before the detail pass refills them.
+  if (prev) {
+    DETAIL_COLS.forEach(k => { if (prev[k]) row[k] = prev[k]; });
+    if (alreadyDetailed) row['Detail Fetched'] = 'yes';
+  }
+  return { json: row };
+});
 `),
-    sticky([
-      '## Phase 1 — list scrape (cheap)',
-      '',
-      'Paginates `r=7` then `r=2` until a page returns nothing new, then writes one row per unique company using **only the fields already visible in search results** (name, status, ЕДБ, address, employees, revenue) — no profile visits.',
-      '',
-      '1 request per results page. Dedupe is by ЕДБ, falling back to profile URL when ЕДБ is absent, so nothing is silently dropped.',
-      '',
-      '**`Phase 1 Summary` is the Step-7 checkpoint** — it prints the unique count and what Phase 2 will cost in requests and wall-clock time. Read it before running Phase 2.'
-    ].join('\n'), [-880, -80], [520, 340], 5),
-    sticky([
-      '### Rate limiting',
-      '',
-      'One in-flight request at a time (a single item through a sequential loop) plus a `waitSeconds` Wait before every fetch.',
-      '',
-      'On 403/429 the region stops and logs — it never auto-retries into a block.'
-    ].join('\n'), [0, 60], [380, 200], 6)
-  ];
+    sheets('Write List Rows', [1100, 420], {
+      operation: 'appendOrUpdate',
+      matchingColumns: ['Profile URL']
+    }),
+    codeNode('Select For Detail', [1320, 420], `
+// Decides which companies still need their profile + /lica fetched.
+// Always returns at least one item so the workflow can reach Run Summary even
+// when there is nothing to enrich.
+const cfg = $('Config').first().json;
+const prepared = $('Prepare Companies').all().map(i => i.json);
 
-  const edges = [
-    ['When clicking Execute', 'Config'],
-    ['Config', 'Seed State'],
-    ['Seed State', 'Build Search URL'],
-    ['Build Search URL', 'Rate Limit Wait'],
-    ['Rate Limit Wait', 'Fetch Search Page'],
-    ['Fetch Search Page', 'Parse Search Page'],
-    ['Parse Search Page', 'More Pages?'],
-    ['More Pages?', 'Build Search URL', 0],   // true  -> keep crawling
-    ['More Pages?', 'Dedupe Companies', 1],   // false -> finished
-    ['More Pages?', 'Phase 1 Summary', 1],
-    ['Dedupe Companies', 'Write List Rows']
-  ];
-
-  return workflow('CompanyWall — 01 Phase 1 List Scrape', nodes, edges);
+if (!cfg.fetchDetails) {
+  return [{ json: { __none: true, reason: 'fetchDetails is false — list fields only.' } }];
 }
 
-/* ================================================================== *
- * Workflow 02 — Phase 2: per-company profile + /lica enrichment
- * ================================================================== */
+let pending = prepared.filter(r =>
+  r['Profile URL'] && String(r['Detail Fetched'] || '').toLowerCase() !== 'yes');
 
-function buildPhase2() {
-  const nodes = [
-    manualTrigger('When clicking Execute', [-880, 300]),
-    codeNode('Config', [-660, 300], CONFIG_BODY),
-    sheetsRead('Read Companies From Sheet', [-440, 300]),
-    codeNode('Select Rows To Enrich', [-220, 300], `
-// Reads back what Phase 1 wrote. This is the checkpoint made concrete: prune or
-// reorder rows in the sheet and Phase 2 only touches what is left.
-const cfg = $('Config').first().json;
-const rows = $input.all().map(i => i.json);
-
-let pending = rows.filter(r => {
-  const url = r['Profile URL'];
-  if (!url || !/^https?:\\/\\//.test(String(url))) return false;
-  return String(r['Detail Fetched'] || '').toLowerCase() !== 'yes'; // resumable
-});
-
-const limit = Number(cfg.maxCompaniesPhase2) || 0;
-const skipped = limit > 0 ? Math.max(0, pending.length - limit) : 0;
+const limit = Number(cfg.maxCompanies) || 0;
+const skippedByLimit = limit > 0 ? Math.max(0, pending.length - limit) : 0;
 if (limit > 0) pending = pending.slice(0, limit);
 
 if (!pending.length) {
-  return [{ json: { nothingToDo: true, message: 'No rows pending enrichment. Either Phase 1 has not run, or every row is already marked "Detail Fetched = yes".' } }];
+  return [{ json: { __none: true, reason: 'Every company found is already enriched from a previous run.' } }];
 }
 
-return pending.map(r => ({
-  json: {
-    profileUrl: String(r['Profile URL']).replace(/\\/+$/, ''),
-    licaUrl: String(r['Profile URL']).replace(/\\/+$/, '') + '/lica',
-    existing: r,
-    _skippedByLimit: skipped
-  }
-}));
+return pending.map(r => {
+  const url = String(r['Profile URL']).replace(/\\/+$/, '');
+  return { json: { profileUrl: url, licaUrl: url + '/lica', existing: r, skippedByLimit } };
+});
 `),
-    splitInBatches('Loop Companies', [0, 300], 1),
-    waitNode('Wait Before Profile', [220, 440]),
-    scrapingBee('Fetch Profile', [440, 440], "={{ $('Loop Companies').item.json.profileUrl }}"),
-    waitNode('Wait Before Lica', [660, 440]),
-    scrapingBee('Fetch Lica', [880, 440], "={{ $('Loop Companies').item.json.licaUrl }}"),
-    codeNode('Merge Detail', [1100, 440], `
+    ifNode('Need Details?', [1540, 420], '={{ !$json.__none }}'),
+    splitInBatches('Loop Companies', [1760, 520], 1),
+    waitNode('Wait Before Profile', [1980, 660]),
+    scrapingBee('Fetch Profile', [2200, 660], "={{ $('Loop Companies').item.json.profileUrl }}"),
+    waitNode('Wait Before Lica', [2420, 660]),
+    scrapingBee('Fetch Lica', [2640, 660], "={{ $('Loop Companies').item.json.licaUrl }}"),
+    codeNode('Merge Detail', [2860, 660], `
 const cfg = $('Config').first().json;
 const src = $('Loop Companies').item.json;
 const existing = src.existing || {};
@@ -770,8 +555,8 @@ else {
   if (!l.owners.length && !l.managers.length) notes.push('LICA_NO_PEOPLE_PARSED');
 }
 
-// Phase 1 values win for the list fields (they came from the filtered search);
-// the profile page only fills gaps. Detail-only fields always come from Phase 2.
+// The list fields came from the filtered search and win; the profile page only
+// fills gaps. Detail-only fields always come from this pass.
 const merged = {
   name: existing['Company Name'] || p.name,
   status: existing['Status'] || '',
@@ -793,69 +578,139 @@ const merged = {
   notes: notes
 };
 
-// Brief: never drop a record because a regex missed — write it with blanks and
-// the profile URL so it can be reviewed by hand.
+// Never drop a record because a regex missed — write it with blanks plus the
+// profile URL and a note, so it can be reviewed by hand.
 return { json: buildSheetRow(merged, cfg.multiValueSeparator) };
 `, { forEach: true }),
-    sheets('Update Company Row', [1320, 440], {
+    sheets('Update Company Row', [3080, 660], {
       operation: 'appendOrUpdate',
       matchingColumns: ['Profile URL']
     }),
-    codeNode('Phase 2 Summary', [220, 160], `
-const rows = $input.all().map(i => i.json).filter(r => r && r['Profile URL']);
+    codeNode('Run Summary', [2000, 300], `
+const cfg     = $('Config').first().json;
+const crawl   = $('Parse Search Page').first().json;
+const prepared = $('Prepare Companies').all().map(i => i.json);
 
-const withPhone   = rows.filter(r => r['Phones']).length;
-const withEmail   = rows.filter(r => r['Emails']).length;
-const withOwners  = rows.filter(r => r['Owners']).length;
-const withMgrs    = rows.filter(r => r['Managers']).length;
-const withNkd     = rows.filter(r => r['NKD Code']).length;
-const withDate    = rows.filter(r => r['Date Founded']).length;
+// Reached either from the detail loop (enriched rows) or from the
+// "nothing to enrich" branch (a single sentinel item).
+let enriched = [];
+let skipReason = '';
+const inbound = $input.all().map(i => i.json);
+if (inbound.length === 1 && inbound[0].__none) skipReason = inbound[0].reason;
+else enriched = inbound.filter(r => r && r['Profile URL']);
 
-const blocked = rows.filter(r => /BLOCKED/.test(String(r['Notes'] || '')));
-const problems = rows.filter(r => r['Notes']).map(r => r['Profile URL'] + ' -> ' + r['Notes']);
+const pct = (n, d) => d ? Math.round((n / d) * 100) + '%' : 'n/a';
+const has = (rows, col) => rows.filter(r => r[col]).length;
 
-const pct = n => rows.length ? Math.round((n / rows.length) * 100) + '%' : 'n/a';
+const blocked = enriched.filter(r => /BLOCKED/.test(String(r['Notes'] || '')));
+const newThisRun = prepared.filter(r => String(r['Detail Fetched'] || '').toLowerCase() !== 'yes').length;
 
-return [{
-  json: {
-    phase: 2,
-    companiesEnriched: rows.length,
-    scrapingBeeRequests: rows.length * 2,
-    coverage: {
-      phone: withPhone + ' (' + pct(withPhone) + ')',
-      email: withEmail + ' (' + pct(withEmail) + ')',
-      owners: withOwners + ' (' + pct(withOwners) + ')',
-      managers: withMgrs + ' (' + pct(withMgrs) + ')',
-      nkd: withNkd + ' (' + pct(withNkd) + ')',
-      dateFounded: withDate + ' (' + pct(withDate) + ')'
-    },
-    blockedRequests: blocked.length,
-    warning: blocked.length ? 'Some requests were blocked (403/429). Raise waitSeconds or enable premiumProxy, then re-run — already-enriched rows are skipped automatically.' : 'none',
-    rowsWithNotes: problems.length ? problems.slice(0, 50) : ['none'],
-    note: 'Low coverage across the board usually means a parser needs tuning, not that the data is absent. Save a failing page into tests/fixtures/ and run npm test.'
-  }
-}];
+const summary = {
+  region: cfg.region.name + ' (r=' + cfg.region.code + ')',
+  searchPagesFetched: crawl.pagesFetched,
+  companiesFoundThisRegion: prepared.length,
+  alreadyEnrichedFromPreviousRun: prepared.length - newThisRun,
+  companiesEnrichedThisRun: enriched.length,
+  scrapingBeeRequests: crawl.pagesFetched + (enriched.length * 2),
+  rowsMissingEdb: prepared.filter(r => !r['Tax Number (EDB)']).length,
+  crawlErrors: (crawl.errors || []).length ? crawl.errors : ['none']
+};
+
+if (skipReason) summary.detailPassSkipped = skipReason;
+
+if (enriched.length) {
+  summary.fieldCoverage = {
+    phone:       has(enriched, 'Phones') + ' (' + pct(has(enriched, 'Phones'), enriched.length) + ')',
+    email:       has(enriched, 'Emails') + ' (' + pct(has(enriched, 'Emails'), enriched.length) + ')',
+    owners:      has(enriched, 'Owners') + ' (' + pct(has(enriched, 'Owners'), enriched.length) + ')',
+    managers:    has(enriched, 'Managers') + ' (' + pct(has(enriched, 'Managers'), enriched.length) + ')',
+    nkd:         has(enriched, 'NKD Code') + ' (' + pct(has(enriched, 'NKD Code'), enriched.length) + ')',
+    dateFounded: has(enriched, 'Date Founded') + ' (' + pct(has(enriched, 'Date Founded'), enriched.length) + ')'
+  };
+  const withNotes = enriched.filter(r => r['Notes']);
+  summary.rowsNeedingReview = withNotes.length
+    ? withNotes.slice(0, 50).map(r => r['Profile URL'] + ' -> ' + r['Notes'])
+    : ['none'];
+}
+
+if (blocked.length) {
+  summary.WARNING = blocked.length + ' request(s) were blocked (403/429). Raise waitSeconds or set premiumProxy: true, then run again — already-enriched rows are skipped automatically.';
+}
+if (enriched.length && has(enriched, 'Owners') === 0 && has(enriched, 'Managers') === 0) {
+  summary.WARNING_LICA = 'No owners or managers parsed for ANY company. The /lica parser very likely needs tuning — save a page into tests/fixtures/ and run npm test.';
+}
+
+const nextRegion = cfg.region.code === 7 ? 'East, { code: 2, name: \\'East\\' }' : 'Southeast, { code: 7, name: \\'Southeast\\' }';
+summary.NEXT_STEP = 'Set region to ' + nextRegion + ' in the Config node and execute again. Rows from this run will be updated, not duplicated.';
+
+return [{ json: summary }];
 `),
+
     sticky([
-      '## Phase 2 — per-company detail (expensive)',
+      '## CompanyWall.mk → Google Sheets',
       '',
-      '**2 ScrapingBee requests per company** (profile + `/lica`), each preceded by a Wait. Read `Phase 1 Summary` first — at ~5s per request this is roughly 10 seconds of wall-clock per company.',
+      '**Run this workflow twice.** Edit only the `Config` node between runs:',
       '',
-      'Adds: phones, emails, owners + %, managers + position + from-date, NKD code/description, date founded.',
+      '1. `region = { code: 7, name: \'Southeast\' }` → execute',
+      '2. `region = { code: 2, name: \'East\' }` → execute',
       '',
-      '**Resumable.** Rows already marked `Detail Fetched = yes` are skipped, so you can stop and re-run safely. Set `maxCompaniesPhase2` to trial a small batch first.',
+      'Filters: 1–5 employees, all industries (no NKD filter), one region per run.',
       '',
-      'Rows whose parsing failed are still written, with blanks plus a `Notes` value — nothing is dropped.'
-    ].join('\n'), [-880, -100], [560, 360], 7)
+      '**Do a trial run first:** set `maxPages: 1` and `maxCompanies: 3`. That is 7 requests. Check the sheet and `Run Summary`, then go full.'
+    ].join('\n'), [-1120, -60], [520, 320], 4),
+
+    sticky([
+      '### Why the sheet is read first',
+      '',
+      'Run 2 needs to know what run 1 already wrote. `Read Existing Sheet` makes the run idempotent:',
+      '',
+      '- a company found in **both** regions updates its existing row and gets `Region = "Southeast + East"` — no duplicate',
+      '- a company already enriched is **not** re-scraped, so run 2 is cheaper',
+      '- an interrupted run can simply be executed again',
+      '',
+      'Matching is on `Profile URL`, which is always present.'
+    ].join('\n'), [-680, -80], [420, 340], 5),
+
+    sticky([
+      '### Rate limiting',
+      '',
+      'A `Wait` before **every** outbound request, and exactly one request in flight at a time.',
+      '',
+      'On 403/429 the crawl stops and logs rather than retrying, so a soft block never escalates.',
+      '',
+      'Tune `waitSeconds` in Config (default 4).'
+    ].join('\n'), [200, 20], [380, 240], 6),
+
+    sticky([
+      '### Detail pass — 2 requests per company',
+      '',
+      'Profile page → phones, emails, NKD code + description, date founded.',
+      '`/lica` page → owners (+ %), and **all** representatives with position and from-date.',
+      '',
+      'At `waitSeconds: 4` this is ~10 s per company. 1 000 companies ≈ 2 h 45 m.',
+      '',
+      'Set `fetchDetails: false` for a list-only run, or `maxCompanies` to cap it.'
+    ].join('\n'), [2200, 380], [460, 280], 7)
   ];
 
   const edges = [
     ['When clicking Execute', 'Config'],
-    ['Config', 'Read Companies From Sheet'],
-    ['Read Companies From Sheet', 'Select Rows To Enrich'],
-    ['Select Rows To Enrich', 'Loop Companies'],
-    ['Loop Companies', 'Phase 2 Summary', 0],   // done
-    ['Loop Companies', 'Wait Before Profile', 1], // loop
+    ['Config', 'Read Existing Sheet'],
+    ['Read Existing Sheet', 'Seed State'],
+    ['Seed State', 'Build Search URL'],
+    ['Build Search URL', 'Wait Before Search'],
+    ['Wait Before Search', 'Fetch Search Page'],
+    ['Fetch Search Page', 'Parse Search Page'],
+    ['Parse Search Page', 'More Pages?'],
+    ['More Pages?', 'Build Search URL', 0],      // true  -> next page
+    ['More Pages?', 'Prepare Companies', 1],     // false -> region exhausted
+    ['Prepare Companies', 'Write List Rows'],
+    ['Write List Rows', 'Select For Detail'],
+    ['Select For Detail', 'Need Details?'],
+    ['Need Details?', 'Loop Companies', 0],
+    ['Need Details?', 'Run Summary', 1],         // nothing to enrich
+    ['Loop Companies', 'Run Summary', 0],        // loop finished
+    ['Loop Companies', 'Wait Before Profile', 1],
     ['Wait Before Profile', 'Fetch Profile'],
     ['Fetch Profile', 'Wait Before Lica'],
     ['Wait Before Lica', 'Fetch Lica'],
@@ -864,7 +719,7 @@ return [{
     ['Update Company Row', 'Loop Companies']
   ];
 
-  return workflow('CompanyWall — 02 Phase 2 Detail Enrichment', nodes, edges);
+  return workflow('CompanyWall.mk — Companies 1-5 Employees by Region', nodes, edges);
 }
 
 /* ------------------------------------------------------------------ *
@@ -873,16 +728,7 @@ return [{
 
 mkdirSync(OUT_DIR, { recursive: true });
 
-const outputs = [
-  ['00-step0-recon.json', buildRecon()],
-  ['01-phase1-list-scrape.json', buildPhase1()],
-  ['02-phase2-detail-enrichment.json', buildPhase2()]
-];
-
-for (const [file, wf] of outputs) {
-  const path = resolve(OUT_DIR, file);
-  writeFileSync(path, JSON.stringify(wf, null, 2) + '\n', 'utf8');
-  console.log(`wrote workflows/${file}  (${wf.nodes.length} nodes)`);
-}
-
-console.log('\nDone. Import these into n8n, then set credentials + Config in each.');
+const wf = buildWorkflow();
+writeFileSync(resolve(OUT_DIR, 'companywall-scraper.json'), JSON.stringify(wf, null, 2) + '\n', 'utf8');
+console.log(`wrote workflows/companywall-scraper.json  (${wf.nodes.length} nodes)`);
+console.log('\nImport it into n8n, set credentials, then edit the Config node per run.');

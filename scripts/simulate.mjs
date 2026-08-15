@@ -1,13 +1,16 @@
 /**
- * End-to-end simulation of the generated workflows.
+ * End-to-end simulation of the generated workflow.
  *
  *   npm run simulate
  *
  * Executes the *actual JavaScript emitted into the Code nodes* against a mock
- * n8n runtime and mock HTTP responses. This is what verifies the parts unit
- * tests cannot reach: the pagination state machine, the region queue, the
- * stop-on-empty-page rule, 403 handling, cross-region dedupe, and the Phase 2
- * merge — without touching the live site or spending ScrapingBee credits.
+ * n8n runtime, a mock Google Sheet and mock HTTP responses. This verifies what
+ * unit tests cannot reach: the pagination state machine, the stop-on-empty rule,
+ * 403 handling, the detail loop, and — most importantly — that running the
+ * workflow a second time for the other region tops up the same sheet rows
+ * instead of duplicating them.
+ *
+ * No network, no ScrapingBee credits.
  */
 
 import { readFileSync } from 'node:fs';
@@ -32,18 +35,13 @@ function eq(name, actual, expected) {
  * Minimal n8n Code-node runtime
  * ------------------------------------------------------------------ */
 
-function loadWorkflow(file) {
-  const wf = JSON.parse(readFileSync(resolve(ROOT, 'workflows', file), 'utf8'));
+function loadWorkflow() {
+  const wf = JSON.parse(readFileSync(resolve(ROOT, 'workflows/companywall-scraper.json'), 'utf8'));
   const byName = {};
   wf.nodes.forEach(n => { byName[n.name] = n; });
   return { wf, byName };
 }
 
-/**
- * @param node     the n8n Code node
- * @param input    array of item objects ({json}) entering the node
- * @param nodeData map of nodeName -> array of items that node last output
- */
 function runCode(node, input, nodeData = {}) {
   const perItem = node.parameters.mode === 'runOnceForEachItem';
 
@@ -73,11 +71,17 @@ function runCode(node, input, nodeData = {}) {
     const out = invoke(input);
     return Array.isArray(out) ? out : [out];
   }
-  // Per-item mode: n8n calls the code once per item, exposing only that item.
   return input.map(it => {
     const out = invoke([it]);
     return Array.isArray(out) ? out[0] : out;
   });
+}
+
+/** Google Sheets "Append or Update", matching on Profile URL. */
+function upsert(sheet, row) {
+  const i = sheet.findIndex(r => r['Profile URL'] && r['Profile URL'] === row['Profile URL']);
+  if (i >= 0) sheet[i] = { ...sheet[i], ...row };
+  else sheet.push({ ...row });
 }
 
 /* ------------------------------------------------------------------ *
@@ -101,12 +105,12 @@ const C = {
   a: { slug: 'alfa-stip', code: 'AAAA1111', name: 'АЛФА ДООЕЛ Штип', addr: 'ул. 1, Штип', edb: '4029000000001', emp: 3, rev: '1.000.000' },
   b: { slug: 'beta-kocani', code: 'BBBB2222', name: 'БЕТА ДОО Кочани', addr: 'ул. 2, Кочани', edb: '4029000000002', emp: 5, rev: '2.000.000' },
   c: { slug: 'gama-strumica', code: 'CCCC3333', name: 'ГАМА ДОО Струмица', addr: 'ул. 3, Струмица', edb: '4029000000003', emp: 1, rev: '500.000' },
-  // Deliberately present in BOTH region results — must merge into one row.
+  // Deliberately returned by BOTH region searches.
   both: { slug: 'delta-valandovo', code: 'DDDD4444', name: 'ДЕЛТА ДООЕЛ Валандово', addr: 'ул. 4, Валандово', edb: '4029000000004', emp: 2, rev: '750.000' }
 };
 
-/** Southeast (r=7): 2 pages. East (r=2): 1 page. Then empties. */
-function mockSearchFetch(url) {
+/** Southeast (r=7): 2 pages. East (r=2): 1 page. Then empty. */
+function mockSearch(url) {
   const region = (url.match(/[&?]r=(\d+)/) || [])[1];
   const page = parseInt((url.match(/[&?]p=(\d+)/) || [])[1] || '1', 10);
   if (region === '7') {
@@ -114,128 +118,16 @@ function mockSearchFetch(url) {
     if (page === 2) return { statusCode: 200, body: searchPage([C.c]) };
     return { statusCode: 200, body: searchPage([]) };
   }
-  if (region === '2') {
-    if (page === 1) return { statusCode: 200, body: searchPage([C.b, C.both]) };
-    return { statusCode: 200, body: searchPage([]) };
-  }
-  throw new Error('unexpected region ' + region);
-}
-
-/* ------------------------------------------------------------------ *
- * Phase 1 simulation
- * ------------------------------------------------------------------ */
-
-function simulatePhase1(fetchFn) {
-  const { byName } = loadWorkflow('01-phase1-list-scrape.json');
-  const nodeData = {};
-
-  nodeData['Config'] = runCode(byName['Config'], [{ json: {} }], nodeData);
-  let state = runCode(byName['Seed State'], nodeData['Config'], nodeData);
-
-  const requests = [];
-  let guard = 0;
-
-  while (true) {
-    if (++guard > 50) throw new Error('pagination loop did not terminate');
-
-    const built = runCode(byName['Build Search URL'], state, nodeData);
-    nodeData['Build Search URL'] = built;
-
-    const url = built[0].json.targetUrl;
-    requests.push(url);
-    const resp = fetchFn(url);
-
-    state = runCode(byName['Parse Search Page'], [{ json: resp }], nodeData);
-    nodeData['Parse Search Page'] = state;
-
-    if (!state[0].json.hasMore) break; // the IF node
-  }
-
-  const rows = runCode(byName['Dedupe Companies'], state, nodeData);
-  const summary = runCode(byName['Phase 1 Summary'], state, nodeData);
-  return { requests, rows: rows.map(r => r.json), summary: summary[0].json, state: state[0].json };
-}
-
-console.log('--- Phase 1: happy path ---');
-const p1 = simulatePhase1(mockSearchFetch);
-
-eq('P1: request count (2 SE pages + 1 empty, 1 E page + 1 empty)', p1.requests.length, 5);
-ok('P1: page 1 of region 7 has no p= param', !/[&?]p=/.test(p1.requests[0]), p1.requests[0]);
-ok('P1: second request is r=7 page 2', /r=7/.test(p1.requests[1]) && /p=2/.test(p1.requests[1]), p1.requests[1]);
-ok('P1: switches to region 2 after region 7 exhausts',
-  /r=2/.test(p1.requests[3]), p1.requests.join('\n      '));
-ok('P1: every URL carries the 1-5 employee filter',
-  p1.requests.every(u => u.includes('dsm[1].Code=48&dsm[1].From=1&dsm[1].To=5')));
-ok('P1: every URL leaves the industry filter empty',
-  p1.requests.every(u => u.includes('&at=&')));
-
-eq('P1: unique companies written', p1.rows.length, 4);
-eq('P1: total collected before dedupe', p1.summary.totalRowsCollected, 5);
-eq('P1: duplicates removed', p1.summary.duplicatesRemoved, 1);
-
-const delta = p1.rows.find(r => r['Tax Number (EDB)'] === '4029000000004');
-ok('P1: cross-region company found', !!delta);
-eq('P1: cross-region company records BOTH regions', delta['Region'], 'Southeast + East');
-
-const alfa = p1.rows.find(r => r['Tax Number (EDB)'] === '4029000000001');
-eq('P1: name', alfa['Company Name'], 'АЛФА ДООЕЛ Штип');
-eq('P1: status', alfa['Status'], 'Активен');
-eq('P1: address', alfa['Address'], 'ул. 1, Штип');
-eq('P1: employees', alfa['Employees'], 3);
-eq('P1: revenue parsed from MK format', alfa['Revenue MKD'], 1000000);
-eq('P1: region', alfa['Region'], 'Southeast');
-eq('P1: detail not yet fetched', alfa['Detail Fetched'], '');
-ok('P1: profile URL absolute', /^https:\/\/www\.companywall\.com\.mk\/kompanija\//.test(alfa['Profile URL']));
-eq('P1: all 18 columns present on every row',
-  p1.rows.every(r => Object.keys(r).length === 18), true);
-
-eq('P1: per-region breakdown reported', p1.summary.perRegion.length, 2);
-eq('P1: no errors on happy path', p1.summary.errors, ['none']);
-ok('P1: checkpoint reports Phase 2 cost',
-  p1.summary.phase2RequestEstimate === '8 ScrapingBee requests (profile + /lica per company)',
-  p1.summary.phase2RequestEstimate);
-
-/* --- 403 must stop that region, keep what was already collected, and log --- */
-console.log('--- Phase 1: 403 handling ---');
-const p1blocked = simulatePhase1((url) => {
-  const region = (url.match(/[&?]r=(\d+)/) || [])[1];
-  const page = parseInt((url.match(/[&?]p=(\d+)/) || [])[1] || '1', 10);
-  if (region === '7' && page === 1) return { statusCode: 200, body: searchPage([C.a, C.both]) };
-  if (region === '7' && page === 2) return { statusCode: 403, body: 'Forbidden' };
-  if (region === '2' && page === 1) return { statusCode: 200, body: searchPage([C.b]) };
+  if (page === 1) return { statusCode: 200, body: searchPage([C.b, C.both]) };
   return { statusCode: 200, body: searchPage([]) };
-});
-
-ok('P1/403: logs the block', p1blocked.summary.errors.some(e => /BLOCKED 403/.test(e)),
-  JSON.stringify(p1blocked.summary.errors));
-ok('P1/403: does not retry the blocked page',
-  p1blocked.requests.filter(u => /r=7/.test(u) && /p=2/.test(u)).length === 1);
-ok('P1/403: still proceeds to the other region',
-  p1blocked.requests.some(u => /r=2/.test(u)));
-eq('P1/403: keeps rows collected before the block', p1blocked.rows.length, 3);
-ok('P1/403: mentions premiumProxy as the remedy',
-  p1blocked.summary.errors.some(e => /premiumProxy/.test(e)));
-
-/* --- A page that repeats the previous page must not loop forever --- */
-console.log('--- Phase 1: repeated-page guard ---');
-const p1repeat = simulatePhase1((url) => {
-  const region = (url.match(/[&?]r=(\d+)/) || [])[1];
-  // Always returns the same companies, whatever the page number.
-  return { statusCode: 200, body: searchPage(region === '7' ? [C.a] : [C.b]) };
-});
-eq('P1/repeat: stops after the repeat is detected (2 requests per region)', p1repeat.requests.length, 4);
-eq('P1/repeat: no duplicate rows', p1repeat.rows.length, 2);
-
-/* ------------------------------------------------------------------ *
- * Phase 2 simulation
- * ------------------------------------------------------------------ */
+}
 
 const PROFILE_HTML = `<html><body>
-<h1>АЛФА ДООЕЛ Штип</h1>
+<h1>Тест компанија</h1>
 <div><span>ЕДБ</span><span>4029000000001</span></div>
 <div><span>ЕМБС</span><span>7000001</span></div>
 <div><span>Дејност</span><span>47.910 - Трговија на мало преку пошта</span></div>
-<p>АЛФА ДООЕЛ Штип е регистрирана на ул. 1, Штип и работи од 12.05.2016 година. Телефонот за контакт е 032/391-100 и контакт-мејл е info@alfa.mk.</p>
+<p>Тест компанија е регистрирана на ул. 1, Штип и работи од 12.05.2016 година. Телефонот за контакт е 032/391-100 и контакт-мејл е info@alfa.mk.</p>
 <section><span>тел</span><span>032/391-100</span><span>070 111 222</span>
 <span>Е-пошта</span><span>info@alfa.mk</span><span>prodazba@alfa.mk</span></section>
 </body></html>`;
@@ -246,86 +138,262 @@ const LICA_HTML = `<html><body>
 <div><span>Сопственик</span><span>Марко Марковски (100,00%)</span><span>од</span><span>12.05.2016</span></div>
 </body></html>`;
 
-function simulatePhase2(sheetRows, { profile = PROFILE_HTML, lica = LICA_HTML, profileStatus = 200, licaStatus = 200 } = {}) {
-  const { byName } = loadWorkflow('02-phase2-detail-enrichment.json');
+/* ------------------------------------------------------------------ *
+ * Whole-workflow runner
+ * ------------------------------------------------------------------ */
+
+function runWorkflow(opts) {
+  const {
+    regionCode, regionName,
+    sheet = [],
+    searchFetch = mockSearch,
+    profile = PROFILE_HTML, lica = LICA_HTML,
+    profileStatus = 200, licaStatus = 200,
+    fetchDetails, maxCompanies, maxPages
+  } = opts;
+
+  const { byName } = loadWorkflow();
   const nodeData = {};
-  nodeData['Config'] = runCode(byName['Config'], [{ json: {} }], nodeData);
 
-  const selected = runCode(byName['Select Rows To Enrich'],
-    sheetRows.map(r => ({ json: r })), nodeData);
-  if (selected[0].json.nothingToDo) return { nothingToDo: true, selected };
+  // Config is the one node the user edits between runs — patch it the same way.
+  let cfgCode = byName['Config'].parameters.jsCode
+    .replace("const region = { code: 7, name: 'Southeast' };",
+      `const region = { code: ${regionCode}, name: '${regionName}' };`);
+  if (fetchDetails === false) cfgCode = cfgCode.replace('const fetchDetails = true;', 'const fetchDetails = false;');
+  if (maxCompanies != null) cfgCode = cfgCode.replace('const maxCompanies = 0;', `const maxCompanies = ${maxCompanies};`);
+  if (maxPages != null) cfgCode = cfgCode.replace('const maxPages     = 300;', `const maxPages = ${maxPages};`);
+  ok('config patch applied cleanly', cfgCode.includes(`code: ${regionCode}`));
 
-  const out = [];
-  for (const item of selected) {
-    nodeData['Loop Companies'] = [item];
-    nodeData['Fetch Profile'] = [{ json: { statusCode: profileStatus, body: profile } }];
-    const merged = runCode(byName['Merge Detail'],
-      [{ json: { statusCode: licaStatus, body: lica } }], nodeData);
-    out.push(merged[0].json);
+  nodeData['Config'] = runCode({ parameters: { jsCode: cfgCode } }, [{ json: {} }], nodeData);
+
+  // Read Existing Sheet — alwaysOutputData means an empty sheet yields one blank item.
+  const live = sheet.map(r => ({ ...r }));
+  nodeData['Read Existing Sheet'] = live.length ? live.map(r => ({ json: { ...r } })) : [{ json: {} }];
+
+  let state = runCode(byName['Seed State'], nodeData['Read Existing Sheet'], nodeData);
+
+  const searchRequests = [];
+  let guard = 0;
+  while (true) {
+    if (++guard > 60) throw new Error('pagination loop did not terminate');
+    const built = runCode(byName['Build Search URL'], state, nodeData);
+    nodeData['Build Search URL'] = built;
+
+    const url = built[0].json.targetUrl;
+    searchRequests.push(url);
+
+    state = runCode(byName['Parse Search Page'], [{ json: searchFetch(url) }], nodeData);
+    nodeData['Parse Search Page'] = state;
+    if (!state[0].json.hasMore) break;              // the "More Pages?" IF node
   }
-  nodeData['Merge Detail'] = out.map(j => ({ json: j }));
-  const summary = runCode(byName['Phase 2 Summary'], nodeData['Merge Detail'], nodeData);
-  return { rows: out, summary: summary[0].json, selected };
+
+  const prepared = runCode(byName['Prepare Companies'], state, nodeData);
+  nodeData['Prepare Companies'] = prepared;
+  prepared.forEach(p => upsert(live, p.json));      // Write List Rows
+
+  const selected = runCode(byName['Select For Detail'], prepared, nodeData);
+  nodeData['Select For Detail'] = selected;
+
+  const detailRequests = [];
+  let summaryInput;
+
+  if (selected.length === 1 && selected[0].json.__none) {
+    summaryInput = selected;                        // "Need Details?" false branch
+  } else {
+    const enriched = [];
+    for (const item of selected) {                  // Loop Companies, batch size 1
+      nodeData['Loop Companies'] = [item];
+      detailRequests.push(item.json.profileUrl, item.json.licaUrl);
+      nodeData['Fetch Profile'] = [{ json: { statusCode: profileStatus, body: profile } }];
+      const merged = runCode(byName['Merge Detail'],
+        [{ json: { statusCode: licaStatus, body: lica } }], nodeData);
+      upsert(live, merged[0].json);                 // Update Company Row
+      enriched.push(merged[0]);
+    }
+    summaryInput = enriched;                        // Loop Companies "done" output
+  }
+
+  const summary = runCode(byName['Run Summary'], summaryInput, nodeData);
+  return { searchRequests, detailRequests, sheet: live, summary: summary[0].json };
 }
 
-console.log('--- Phase 2: enrichment ---');
-const sheetRows = p1.rows;
-const p2 = simulatePhase2(sheetRows);
+/* ================================================================== *
+ * Run 1 — Southeast
+ * ================================================================== */
 
-eq('P2: enriches every pending row', p2.rows.length, 4);
-const e = p2.rows[0];
-eq('P2: phones joined, deduped', e['Phones'], '032/391-100; 070 111 222');
-eq('P2: emails joined', e['Emails'], 'info@alfa.mk; prodazba@alfa.mk');
-eq('P2: owner with percentage', e['Owners'], 'Марко Марковски (100,00%)');
-eq('P2: ALL managers with position and from-date', e['Managers'],
+console.log('--- Run 1: Southeast (r=7) ---');
+const run1 = runWorkflow({ regionCode: 7, regionName: 'Southeast' });
+
+eq('R1: search requests (2 pages + 1 empty)', run1.searchRequests.length, 3);
+ok('R1: page 1 has no p= param', !/[&?]p=/.test(run1.searchRequests[0]), run1.searchRequests[0]);
+ok('R1: page 2 requested', /[&?]p=2/.test(run1.searchRequests[1]), run1.searchRequests[1]);
+ok('R1: only region 7 queried', run1.searchRequests.every(u => /[&?]r=7/.test(u)));
+ok('R1: employee filter 1-5 on every request',
+  run1.searchRequests.every(u => u.includes('dsm[1].Code=48&dsm[1].From=1&dsm[1].To=5')));
+ok('R1: industry filter left empty', run1.searchRequests.every(u => u.includes('&at=&')));
+
+eq('R1: rows written', run1.sheet.length, 3);
+eq('R1: detail requests (3 companies x 2)', run1.detailRequests.length, 6);
+ok('R1: every profile has a matching /lica request',
+  run1.detailRequests.filter(u => u.endsWith('/lica')).length === 3);
+
+const r1alfa = run1.sheet.find(r => r['Tax Number (EDB)'] === '4029000000001');
+eq('R1: name', r1alfa['Company Name'], 'АЛФА ДООЕЛ Штип');
+eq('R1: status', r1alfa['Status'], 'Активен');
+eq('R1: address', r1alfa['Address'], 'ул. 1, Штип');
+eq('R1: employees', r1alfa['Employees'], 3);
+eq('R1: revenue parsed from MK format', r1alfa['Revenue MKD'], 1000000);
+eq('R1: region', r1alfa['Region'], 'Southeast');
+eq('R1: phones deduped and joined', r1alfa['Phones'], '032/391-100; 070 111 222');
+eq('R1: emails joined', r1alfa['Emails'], 'info@alfa.mk; prodazba@alfa.mk');
+eq('R1: owner with percentage', r1alfa['Owners'], 'Марко Марковски (100,00%)');
+eq('R1: ALL managers, with position and from-date', r1alfa['Managers'],
   'Марко Марковски — Управител (од 12.05.2016); Ана Ангеловска — Раководител на подружница (од 01.01.2020)');
-eq('P2: NKD code', e['NKD Code'], '47.910');
-eq('P2: NKD description', e['NKD Description'], 'Трговија на мало преку пошта');
-eq('P2: date founded', e['Date Founded'], '12.05.2016');
-eq('P2: marked as fetched', e['Detail Fetched'], 'yes');
+eq('R1: NKD code', r1alfa['NKD Code'], '47.910');
+eq('R1: NKD description', r1alfa['NKD Description'], 'Трговија на мало преку пошта');
+eq('R1: date founded', r1alfa['Date Founded'], '12.05.2016');
+eq('R1: marked enriched', r1alfa['Detail Fetched'], 'yes');
+eq('R1: 18 columns on every row', run1.sheet.every(r => Object.keys(r).length === 18), true);
 
-// Phase 1 values must survive Phase 2 — they came from the filtered search.
-const eDelta = p2.rows.find(r => r['Tax Number (EDB)'] === '4029000000004');
-eq('P2: preserves Phase 1 region merge', eDelta['Region'], 'Southeast + East');
-eq('P2: preserves Phase 1 employees', p2.rows.find(r => r['Company Name'] === 'АЛФА ДООЕЛ Штип')['Employees'], 3);
-eq('P2: preserves Phase 1 profile URL', e['Profile URL'], sheetRows[0]['Profile URL']);
+eq('R1: summary region', run1.summary.region, 'Southeast (r=7)');
+eq('R1: summary companies found', run1.summary.companiesFoundThisRegion, 3);
+eq('R1: summary request count', run1.summary.scrapingBeeRequests, 3 + 6);
+eq('R1: no crawl errors', run1.summary.crawlErrors, ['none']);
+ok('R1: summary tells you the next region', /code: 2/.test(run1.summary.NEXT_STEP), run1.summary.NEXT_STEP);
 
-ok('P2: reports coverage', /100%/.test(p2.summary.coverage.phone), JSON.stringify(p2.summary.coverage));
-eq('P2: request count reported', p2.summary.scrapingBeeRequests, 8);
+/* ================================================================== *
+ * Run 2 — East, against the sheet run 1 produced
+ * ================================================================== */
 
-/* --- Resumability: already-enriched rows are skipped --- */
-console.log('--- Phase 2: resume + failure handling ---');
-const alreadyDone = sheetRows.map(r => ({ ...r, 'Detail Fetched': 'yes' }));
-ok('P2/resume: skips rows already fetched', simulatePhase2(alreadyDone).nothingToDo === true);
+console.log('--- Run 2: East (r=2), same sheet ---');
+const run2 = runWorkflow({ regionCode: 2, regionName: 'East', sheet: run1.sheet });
 
-const partial = sheetRows.map((r, i) => i < 2 ? { ...r, 'Detail Fetched': 'yes' } : r);
-eq('P2/resume: only enriches the remainder', simulatePhase2(partial).rows.length, 2);
+ok('R2: only region 2 queried', run2.searchRequests.every(u => /[&?]r=2/.test(u)));
+eq('R2: search requests (1 page + 1 empty)', run2.searchRequests.length, 2);
 
-// A blocked /lica must still write the row, with the profile data and a note.
-const p2blocked = simulatePhase2([sheetRows[0]], { licaStatus: 403 });
-eq('P2/403: row is still written', p2blocked.rows.length, 1);
-eq('P2/403: profile fields survive', p2blocked.rows[0]['Phones'], '032/391-100; 070 111 222');
-eq('P2/403: owners blank', p2blocked.rows[0]['Owners'], '');
-ok('P2/403: note records the block', /LICA_BLOCKED_403/.test(p2blocked.rows[0]['Notes']),
-  p2blocked.rows[0]['Notes']);
-ok('P2/403: summary warns', /blocked/i.test(p2blocked.summary.warning), p2blocked.summary.warning);
+// C.both was already found in run 1; only C.b is new.
+eq('R2: total rows after both runs (no duplicates)', run2.sheet.length, 4);
+eq('R2: only the genuinely new company is enriched', run2.detailRequests.length, 2);
+ok('R2: does NOT re-fetch the company already enriched in run 1',
+  !run2.detailRequests.some(u => u.includes('delta-valandovo')),
+  JSON.stringify(run2.detailRequests));
 
-// Total parse failure must not drop the record — brief requires the URL survives.
-const p2junk = simulatePhase2([sheetRows[0]], { profile: '<html><body>nothing</body></html>', lica: '<html><body>nothing</body></html>' });
-eq('P2/junk: record not dropped', p2junk.rows.length, 1);
-eq('P2/junk: profile URL retained for manual review', p2junk.rows[0]['Profile URL'], sheetRows[0]['Profile URL']);
-eq('P2/junk: Phase 1 fields retained', p2junk.rows[0]['Company Name'], 'АЛФА ДООЕЛ Штип');
-ok('P2/junk: notes explain what failed', /NO_PHONE_FOUND/.test(p2junk.rows[0]['Notes']), p2junk.rows[0]['Notes']);
+const r2both = run2.sheet.find(r => r['Tax Number (EDB)'] === '4029000000004');
+eq('R2: cross-region company records BOTH regions', r2both['Region'], 'Southeast + East');
+eq('R2: its run-1 detail is preserved, not blanked', r2both['Owners'], 'Марко Марковски (100,00%)');
+eq('R2: its run-1 phones preserved', r2both['Phones'], '032/391-100; 070 111 222');
+eq('R2: still marked enriched', r2both['Detail Fetched'], 'yes');
 
-/* --- maxCompaniesPhase2 trial-run limit --- */
-const { byName: p2nodes } = loadWorkflow('02-phase2-detail-enrichment.json');
-const cfgCode = p2nodes['Config'].parameters.jsCode.replace('maxCompaniesPhase2: 0', 'maxCompaniesPhase2: 2');
-const limitedCfg = new Function('$input', '$', '$json', cfgCode)({ all: () => [] }, () => {}, {});
-const nodeDataLimited = { Config: limitedCfg };
-const limited = runCode(p2nodes['Select Rows To Enrich'], sheetRows.map(r => ({ json: r })), nodeDataLimited);
-eq('P2/limit: maxCompaniesPhase2 caps the batch', limited.length, 2);
+const r2beta = run2.sheet.find(r => r['Tax Number (EDB)'] === '4029000000002');
+eq('R2: new company region', r2beta['Region'], 'East');
+eq('R2: new company enriched', r2beta['Detail Fetched'], 'yes');
 
-/* ------------------------------------------------------------------ */
+const r2alfa = run2.sheet.find(r => r['Tax Number (EDB)'] === '4029000000001');
+eq('R2: run-1-only company untouched', r2alfa['Region'], 'Southeast');
+eq('R2: run-1-only company keeps its data', r2alfa['NKD Code'], '47.910');
+
+eq('R2: summary counts previously-enriched', run2.summary.alreadyEnrichedFromPreviousRun, 1);
+eq('R2: summary counts newly enriched', run2.summary.companiesEnrichedThisRun, 1);
+ok('R2: summary points back to Southeast', /code: 7/.test(run2.summary.NEXT_STEP), run2.summary.NEXT_STEP);
+
+/* --- Re-running the same region must be a no-op --- */
+console.log('--- Re-run: idempotency ---');
+const rerun = runWorkflow({ regionCode: 7, regionName: 'Southeast', sheet: run2.sheet });
+eq('Rerun: no new rows', rerun.sheet.length, 4);
+eq('Rerun: no detail requests', rerun.detailRequests.length, 0);
+eq('Rerun: region field not corrupted', rerun.sheet.find(r => r['Tax Number (EDB)'] === '4029000000004')['Region'], 'Southeast + East');
+ok('Rerun: summary explains the skip', /already enriched/i.test(rerun.summary.detailPassSkipped || ''),
+  rerun.summary.detailPassSkipped);
+
+/* ================================================================== *
+ * Failure modes
+ * ================================================================== */
+
+console.log('--- 403 on search ---');
+const blocked = runWorkflow({
+  regionCode: 7, regionName: 'Southeast',
+  searchFetch: (url) => {
+    const page = parseInt((url.match(/[&?]p=(\d+)/) || [])[1] || '1', 10);
+    if (page === 1) return { statusCode: 200, body: searchPage([C.a, C.both]) };
+    return { statusCode: 403, body: 'Forbidden' };
+  }
+});
+ok('403: logged', blocked.summary.crawlErrors.some(e => /BLOCKED 403/.test(e)),
+  JSON.stringify(blocked.summary.crawlErrors));
+ok('403: not retried', blocked.searchRequests.filter(u => /[&?]p=2/.test(u)).length === 1);
+eq('403: rows found before the block are kept', blocked.sheet.length, 2);
+ok('403: remedy suggested', blocked.summary.crawlErrors.some(e => /premiumProxy/.test(e)));
+
+console.log('--- repeated page guard ---');
+const repeat = runWorkflow({
+  regionCode: 7, regionName: 'Southeast',
+  searchFetch: () => ({ statusCode: 200, body: searchPage([C.a]) })  // same page forever
+});
+eq('repeat: stops once nothing new arrives', repeat.searchRequests.length, 2);
+eq('repeat: single row', repeat.sheet.length, 1);
+
+console.log('--- maxPages guard ---');
+const capped = runWorkflow({
+  regionCode: 7, regionName: 'Southeast', maxPages: 1,
+  searchFetch: (url) => {
+    const page = parseInt((url.match(/[&?]p=(\d+)/) || [])[1] || '1', 10);
+    return { statusCode: 200, body: searchPage(page < 5 ? [{ ...C.a, code: 'X' + page, slug: 's' + page }] : []) };
+  }
+});
+eq('maxPages: stops at the cap', capped.searchRequests.length, 1);
+ok('maxPages: warns about truncation', capped.summary.crawlErrors.some(e => /maxPages/.test(e)));
+
+console.log('--- blocked /lica must still write the row ---');
+const licaBlocked = runWorkflow({ regionCode: 7, regionName: 'Southeast', licaStatus: 403 });
+const lb = licaBlocked.sheet[0];
+eq('lica 403: row still written', licaBlocked.sheet.length, 3);
+eq('lica 403: profile data survives', lb['Phones'], '032/391-100; 070 111 222');
+eq('lica 403: owners blank', lb['Owners'], '');
+ok('lica 403: note records it', /LICA_BLOCKED_403/.test(lb['Notes']), lb['Notes']);
+ok('lica 403: summary warns', /blocked/i.test(licaBlocked.summary.WARNING || ''), licaBlocked.summary.WARNING);
+
+console.log('--- unparseable pages must not drop records ---');
+const junk = runWorkflow({
+  regionCode: 7, regionName: 'Southeast',
+  profile: '<html><body>nothing here</body></html>',
+  lica: '<html><body>nothing here</body></html>'
+});
+eq('junk: records kept', junk.sheet.length, 3);
+ok('junk: profile URL retained for manual review', !!junk.sheet[0]['Profile URL']);
+eq('junk: list fields retained', junk.sheet[0]['Company Name'], 'АЛФА ДООЕЛ Штип');
+ok('junk: notes explain the miss', /NO_PHONE_FOUND/.test(junk.sheet[0]['Notes']), junk.sheet[0]['Notes']);
+ok('junk: summary flags the lica parser', /lica parser/i.test(junk.summary.WARNING_LICA || ''),
+  junk.summary.WARNING_LICA);
+
+/* ================================================================== *
+ * Config switches
+ * ================================================================== */
+
+console.log('--- config switches ---');
+const listOnly = runWorkflow({ regionCode: 7, regionName: 'Southeast', fetchDetails: false });
+eq('fetchDetails=false: no detail requests', listOnly.detailRequests.length, 0);
+eq('fetchDetails=false: list rows still written', listOnly.sheet.length, 3);
+eq('fetchDetails=false: list fields present', listOnly.sheet[0]['Employees'], 3);
+eq('fetchDetails=false: detail columns blank', listOnly.sheet[0]['Phones'], '');
+ok('fetchDetails=false: summary says why', /fetchDetails is false/.test(listOnly.summary.detailPassSkipped || ''),
+  listOnly.summary.detailPassSkipped);
+
+const trial = runWorkflow({ regionCode: 7, regionName: 'Southeast', maxPages: 1, maxCompanies: 2 });
+eq('trial run: one search page', trial.searchRequests.length, 1);
+eq('trial run: two companies enriched (4 requests)', trial.detailRequests.length, 4);
+eq('trial run: total requests as advertised', trial.summary.scrapingBeeRequests, 1 + 4);
+
+// A company held back by the cap must stay pending, and be picked up next run.
+const capped1 = runWorkflow({ regionCode: 7, regionName: 'Southeast', maxPages: 1, maxCompanies: 1 });
+eq('cap: only one company enriched', capped1.detailRequests.length, 2);
+eq('cap: the other stays pending', capped1.sheet.filter(r => r['Detail Fetched'] !== 'yes').length, 1);
+
+const capped2 = runWorkflow({ regionCode: 7, regionName: 'Southeast', maxPages: 1, sheet: capped1.sheet });
+eq('cap: next run picks up exactly the pending one', capped2.detailRequests.length, 2);
+eq('cap: nothing left pending afterwards', capped2.sheet.filter(r => r['Detail Fetched'] !== 'yes').length, 0);
+eq('cap: no duplicate rows across the two runs', capped2.sheet.length, 2);
+
+/* ================================================================== */
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail) console.log('\nFailures:\n' + failures.join('\n'));
