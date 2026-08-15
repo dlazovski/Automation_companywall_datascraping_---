@@ -361,7 +361,8 @@ return [{
     companies: [],
     seen: [],
     errors: [],
-    pagesFetched: 0
+    pagesFetched: 0,
+    totalReported: null
   }
 }];
 `),
@@ -387,6 +388,7 @@ const html = String(resp.body == null ? (resp.data == null ? '' : resp.data) : r
 
 const errors = (st.errors || []).slice();
 const seen   = new Set(st.seen || []);
+let totalReported = st.totalReported == null ? null : st.totalReported;
 let companies = (st.companies || []).slice();
 
 let stop = false;
@@ -411,6 +413,11 @@ if (statusCode === 403 || statusCode === 429) {
   // the flags are consulted below only to explain an empty result.
   const parsed = parseSearchResults(html);
   pageRows = parsed.rows.length;
+
+  // The site prints its own result count ("Пронајдени N резултати"). Keeping it
+  // is the only way to tell "the region really is this small" apart from
+  // "pagination stopped early" — the two look identical from the row counts.
+  if (parsed.total != null && totalReported == null) totalReported = parsed.total;
 
   const fresh = parsed.rows.filter(r => r.profileUrl && !seen.has(r.profileUrl));
   fresh.forEach(r => {
@@ -454,6 +461,7 @@ return {
     seen: Array.from(seen),
     errors,
     pagesFetched: (st.pagesFetched || 0) + 1,
+    totalReported,
     hasMore: !stop,
     lastPage: { page: st.page, rows: pageRows, newRows, statusCode, htmlLength: html.length, healthFlags }
   }
@@ -650,6 +658,7 @@ const newThisRun = prepared.filter(r => String(r['Detail Fetched'] || '').toLowe
 const summary = {
   region: cfg.region.name + ' (r=' + cfg.region.code + ')',
   searchPagesFetched: crawl.pagesFetched,
+  siteReportedTotal: crawl.totalReported == null ? 'not printed on the page' : crawl.totalReported,
   companiesFoundThisRegion: prepared.length,
   alreadyEnrichedFromPreviousRun: prepared.length - newThisRun,
   companiesEnrichedThisRun: enriched.length,
@@ -677,6 +686,12 @@ if (enriched.length) {
 
 if (blocked.length) {
   summary.WARNING = blocked.length + ' request(s) were blocked (403/429). Raise waitSeconds or set premiumProxy: true, then run again — already-enriched rows are skipped automatically.';
+}
+
+// Collecting far fewer companies than the site says exist means pagination
+// stopped early — a cap on anonymous paging, or a changed page parameter.
+if (typeof crawl.totalReported === 'number' && crawl.totalReported > prepared.length * 1.1) {
+  summary.WARNING_TRUNCATED = 'The site reports ' + crawl.totalReported + ' results for this region but only ' + prepared.length + ' were collected, over ' + crawl.pagesFetched + ' pages. Pagination stopped early — open the search URL with &p=' + (crawl.pagesFetched) + ' in a browser to see whether more results exist.';
 }
 if (enriched.length && has(enriched, 'Owners') === 0 && has(enriched, 'Managers') === 0) {
   summary.WARNING_LICA = 'No owners or managers parsed for ANY company. The /lica parser very likely needs tuning — save a page into tests/fixtures/ and run npm test.';

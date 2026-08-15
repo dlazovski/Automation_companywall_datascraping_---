@@ -88,8 +88,10 @@ function upsert(sheet, row) {
  * Mock pages
  * ------------------------------------------------------------------ */
 
-function searchPage(companies) {
+/** `total` mimics the site's own "Пронајдени N резултати" line; omit for none. */
+function searchPage(companies, total) {
   if (!companies.length) return '<html><body><div>Нема резултати</div>' + 'x'.repeat(2000) + '</body></html>';
+  const totalLine = total == null ? '' : '<div>Пронајдени ' + total + ' резултати</div>';
   return '<html><body>' + companies.map(c => `
     <div class="row">
       <a href="/kompanija/${c.slug}/${c.code}">${c.name}</a>
@@ -98,7 +100,7 @@ function searchPage(companies) {
       <div>ЕДБ: ${c.edb}</div>
       <div>Вработени: ${c.emp}</div>
       <div>Приходи: ${c.rev}</div>
-    </div>`).join('') + '<div>Пронајдени 4 резултати</div>' + 'x'.repeat(2000) + '</body></html>';
+    </div>`).join('') + totalLine + 'x'.repeat(2000) + '</body></html>';
 }
 
 const C = {
@@ -383,6 +385,36 @@ eq('cross-page: pagination still advanced past the overlap',
 /* ================================================================== *
  * Failure modes
  * ================================================================== */
+
+console.log('--- pagination cut short vs. a genuinely small region ---');
+// The site says there are 850 results, we only collected 3 pages' worth.
+// That is indistinguishable from a small region unless we read the site's own
+// count — which is exactly the ambiguity this warning exists to remove.
+const truncated = runWorkflow({
+  regionCode: 7, regionName: 'Southeast', fetchDetails: false,
+  searchFetch: (url) => {
+    const page = parseInt((url.match(/[&?]p=(\d+)/) || [])[1] || '1', 10);
+    if (page === 1) return { statusCode: 200, body: searchPage([C.a, C.b], 850) };
+    if (page === 2) return { statusCode: 200, body: searchPage([C.c], 850) };
+    return { statusCode: 200, body: searchPage([], 850) }; // site stops serving
+  }
+});
+eq('truncated: site total captured', truncated.summary.siteReportedTotal, 850);
+eq('truncated: collected far fewer', truncated.summary.companiesFoundThisRegion, 3);
+ok('truncated: warning raised', /pagination stopped early/i.test(truncated.summary.WARNING_TRUNCATED || ''),
+  truncated.summary.WARNING_TRUNCATED);
+ok('truncated: warning names both numbers',
+  /850/.test(truncated.summary.WARNING_TRUNCATED) && /only 3/.test(truncated.summary.WARNING_TRUNCATED));
+
+const notTruncated = runWorkflow({
+  regionCode: 7, regionName: 'Southeast', fetchDetails: false,
+  searchFetch: (url) => /p=2/.test(url)
+    ? { statusCode: 200, body: searchPage([], 2) }
+    : { statusCode: 200, body: searchPage([C.a, C.b], 2) }
+});
+eq('small region: total matches what we collected', notTruncated.summary.siteReportedTotal, 2);
+ok('small region: no false truncation warning', !notTruncated.summary.WARNING_TRUNCATED,
+  notTruncated.summary.WARNING_TRUNCATED);
 
 console.log('--- reCAPTCHA script on a good page must NOT abort ---');
 // Regression: CompanyWall loads reCAPTCHA for its own login form, so the string
