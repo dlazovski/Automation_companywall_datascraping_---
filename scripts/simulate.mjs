@@ -306,6 +306,73 @@ ok('Rerun: summary explains the skip', /already enriched/i.test(rerun.summary.de
   rerun.summary.detailPassSkipped);
 
 /* ================================================================== *
+ * Dedupe edge cases
+ * ================================================================== */
+
+console.log('--- dedupe: same company, different profile URL ---');
+// The brief's dedupe key is ЕДБ. Simulate the other region having linked the
+// same company under a different slug/code, so URL matching alone would fail.
+const altSheet = [{
+  ...run1.sheet.find(r => r['Tax Number (EDB)'] === '4029000000004'),
+  'Profile URL': 'https://www.companywall.com.mk/kompanija/delta-old-slug/ZZZZ9999'
+}];
+const altRun = runWorkflow({ regionCode: 2, regionName: 'East', sheet: altSheet });
+
+eq('altURL: no duplicate row created', altRun.sheet.length, 2);
+const altBoth = altRun.sheet.find(r => r['Tax Number (EDB)'] === '4029000000004');
+eq('altURL: matched by ЕДБ, regions merged', altBoth['Region'], 'Southeast + East');
+eq('altURL: existing row key preserved so the update lands on it',
+  altBoth['Profile URL'], 'https://www.companywall.com.mk/kompanija/delta-old-slug/ZZZZ9999');
+eq('altURL: not re-scraped', altRun.detailRequests.filter(u => u.includes('delta')).length, 0);
+ok('altURL: the alternate URL is recorded for traceability',
+  /MATCHED_BY_EDB_ALT_URL/.test(altBoth['Notes']), altBoth['Notes']);
+
+console.log('--- dedupe: rows with no ЕДБ must not collide ---');
+// Two distinct companies, neither exposing a ЕДБ on the results page.
+const noEdbPage = `<html><body>
+  <div class="row"><a href="/kompanija/no-edb-one/NEDB0001">ПРВА БЕЗ ЕДБ</a>
+    <span>Активен</span><div>Адреса: ул. А 1, Штип</div><div>Вработени: 2</div></div>
+  <div class="row"><a href="/kompanija/no-edb-two/NEDB0002">ВТОРА БЕЗ ЕДБ</a>
+    <span>Активен</span><div>Адреса: ул. Б 2, Берово</div><div>Вработени: 4</div></div>
+${'x'.repeat(2000)}</body></html>`;
+
+const noEdb = runWorkflow({
+  regionCode: 7, regionName: 'Southeast', fetchDetails: false,
+  searchFetch: (url) => /p=2/.test(url)
+    ? { statusCode: 200, body: searchPage([]) }
+    : { statusCode: 200, body: noEdbPage }
+});
+eq('no-ЕДБ: both companies kept as separate rows', noEdb.sheet.length, 2);
+eq('no-ЕДБ: neither is dropped', noEdb.sheet.filter(r => r['Company Name']).length, 2);
+eq('no-ЕДБ: summary counts them as needing review', noEdb.summary.rowsMissingEdb, 2);
+
+// Re-running must still not merge them into one another.
+const noEdbAgain = runWorkflow({
+  regionCode: 2, regionName: 'East', fetchDetails: false, sheet: noEdb.sheet,
+  searchFetch: (url) => /p=2/.test(url)
+    ? { statusCode: 200, body: searchPage([]) }
+    : { statusCode: 200, body: noEdbPage }
+});
+eq('no-ЕДБ: still two rows after a second run', noEdbAgain.sheet.length, 2);
+eq('no-ЕДБ: matched by URL, regions merged',
+  noEdbAgain.sheet.every(r => r['Region'] === 'Southeast + East'), true);
+
+console.log('--- dedupe: within a single page and across pages ---');
+// Same company linked twice on one page (logo + title) and again on page 2.
+const repeatedAcrossPages = runWorkflow({
+  regionCode: 7, regionName: 'Southeast', fetchDetails: false,
+  searchFetch: (url) => {
+    const page = parseInt((url.match(/[&?]p=(\d+)/) || [])[1] || '1', 10);
+    if (page === 1) return { statusCode: 200, body: searchPage([C.a, C.b]) };
+    if (page === 2) return { statusCode: 200, body: searchPage([C.b, C.c]) }; // C.b repeats
+    return { statusCode: 200, body: searchPage([]) };
+  }
+});
+eq('cross-page: repeated company counted once', repeatedAcrossPages.sheet.length, 3);
+eq('cross-page: pagination still advanced past the overlap',
+  repeatedAcrossPages.searchRequests.length, 3);
+
+/* ================================================================== *
  * Failure modes
  * ================================================================== */
 

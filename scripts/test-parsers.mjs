@@ -215,6 +215,8 @@ check('profile: emails (both, site email excluded)', p.emails,
   ['info@btehnologi.mk', 'sales@btehnologi.mk']);
 ok('profile: captures multiple phones', p.phones.length >= 2, JSON.stringify(p.phones));
 check('profile: dedupes 070 555 123 against +389 70 555 123', p.phones.length, 2);
+// The tel: href is bare digits (023221455); the visible block form must win.
+check('profile: keeps the human-readable phone format', p.phones, ['02/3221-455', '070 555 123']);
 ok('profile: no NO_PHONE/NO_EMAIL notes', !p.notes.some(n => /NO_(PHONE|EMAIL)/.test(n)),
   JSON.stringify(p.notes));
 

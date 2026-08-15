@@ -456,16 +456,34 @@ return {
 const cfg = $('Config').first().json;
 const st  = $input.first().json;
 
-const previous = {};
+// Index previous rows two ways. Google Sheets matches on Profile URL, but the
+// brief's dedupe key is ЕДБ — so a company that surfaced in the other region
+// under a DIFFERENT profile URL must still resolve to the same row.
+const byUrl = {};
+const byEdb = {};
 $('Read Existing Sheet').all()
   .map(i => i.json)
   .filter(r => r && r['Profile URL'])
-  .forEach(r => { previous[String(r['Profile URL']).replace(/\\/+$/, '')] = r; });
+  .forEach(r => {
+    byUrl[String(r['Profile URL']).replace(/\\/+$/, '')] = r;
+    const e = String(r['Tax Number (EDB)'] || '').trim();
+    if (e) byEdb[e] = r; // never index on an empty ЕДБ — they would all collide
+  });
 
 const DETAIL_COLS = ['Phones', 'Emails', 'Owners', 'Managers', 'NKD Code', 'NKD Description', 'Date Founded'];
 
 return dedupeCompanies(st.companies || []).map(c => {
-  const prev = previous[c.profileUrl];
+  const prev = byUrl[c.profileUrl] || (c.edb ? byEdb[c.edb] : null);
+
+  // Write against the URL the existing row already uses, so appendOrUpdate
+  // updates that row rather than appending a second one for the same company.
+  const prevUrl = prev && prev['Profile URL'] ? String(prev['Profile URL']).replace(/\\/+$/, '') : '';
+  const rowUrl = prevUrl || c.profileUrl;
+
+  const notes = (c.notes || []).slice();
+  if (prevUrl && prevUrl !== c.profileUrl) {
+    notes.push('MATCHED_BY_EDB_ALT_URL:' + c.profileUrl);
+  }
 
   // A company can legitimately appear in both regions — keep both labels.
   let region = c.region;
@@ -476,7 +494,10 @@ return dedupeCompanies(st.companies || []).map(c => {
   }
 
   const alreadyDetailed = !!prev && String(prev['Detail Fetched'] || '').toLowerCase() === 'yes';
-  const row = buildSheetRow(Object.assign({}, c, { region, detailFetched: alreadyDetailed }), cfg.multiValueSeparator);
+  const row = buildSheetRow(
+    Object.assign({}, c, { region, notes, profileUrl: rowUrl, detailFetched: alreadyDetailed }),
+    cfg.multiValueSeparator
+  );
 
   // Carry forward detail already gathered by an earlier run, otherwise this
   // write would blank those cells before the detail pass refills them.
