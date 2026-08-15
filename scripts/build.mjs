@@ -309,6 +309,23 @@ const sheetName     = 'Companies';                     // tab name
 // Set to false only to reproduce the old single-query behaviour.
 const splitByEmployeeCount = true;
 
+// ===== TOWNS (optional, but this is how you get past ~300 per region) =====
+// Each search shows at most ~60 results however deep you page, so a region-wide
+// search caps out. One search PER TOWN per headcount keeps every search under
+// that ceiling — and these are the towns you actually want anyway.
+//
+// To find a code: open the site's advanced search, pick the town, and read the
+// c=NNN value out of the address bar. Leave the list empty to search the whole
+// region (the old behaviour).
+const towns = [
+  // { code: '', name: 'Штип' },
+  // { code: '', name: 'Струмица' },
+];
+
+// Simpler alternative to the list above: set ONE town code here and run once
+// per town, changing only this line. Ignored when `towns` is populated.
+const townCode = '';
+
 const maxPages     = 300; // safety stop, per slice
 const maxCompanies = 0;   // 0 = every company found; otherwise cap the detail pass
 const fetchDetails = true; // false = list fields only, no profile/lica requests
@@ -322,6 +339,8 @@ return [{
     maxCompanies,
     fetchDetails,
     splitByEmployeeCount,
+    towns,
+    townCode,
 
     employeesFrom: 1,
     employeesTo: 5,
@@ -371,13 +390,32 @@ const cfg = $('Config').first().json;
 const from = Number(cfg.employeesFrom);
 const to   = Number(cfg.employeesTo);
 
-let slices;
+// One search per (town x headcount). Both axes partition cleanly — a company
+// sits in exactly one town and has exactly one headcount — so the slices never
+// overlap, and their union is the whole region.
+const towns = (Array.isArray(cfg.towns) && cfg.towns.length)
+  ? cfg.towns
+  : [{ code: '', name: '' }]; // no town list -> whole region, as before
+
+const heads = [];
 if (cfg.splitByEmployeeCount !== false) {
-  slices = [];
-  for (let n = from; n <= to; n++) slices.push({ from: n, to: n, label: n + ' employees' });
+  for (let n = from; n <= to; n++) heads.push({ from: n, to: n });
 } else {
-  slices = [{ from: from, to: to, label: from + '-' + to + ' employees' }];
+  heads.push({ from: from, to: to });
 }
+
+const slices = [];
+towns.forEach(t => {
+  heads.forEach(h => {
+    const head = h.from === h.to ? h.from + ' employees' : h.from + '-' + h.to + ' employees';
+    slices.push({
+      from: h.from,
+      to: h.to,
+      town: t.code || '',
+      label: (t.name ? t.name + ', ' : '') + head
+    });
+  });
+});
 
 return [{
   json: {
@@ -397,13 +435,19 @@ return [{
 }];
 `),
     codeNode('Build Search URL', [-240, 300], `
+const cfg = $('Config').first().json;
 const st = $input.item.json;
 const slice = st.slices[st.sliceIdx];
 
+// Town comes from the slice when Seed State built a town x headcount grid.
+// Falling back to cfg.townCode lets a single town be driven from Config alone,
+// so one town per run works without touching Seed State.
+const town = slice.town || cfg.townCode || '';
+
 return {
   json: Object.assign({}, st, {
-    sliceLabel: slice.label,
-    targetUrl: buildSearchUrl(st.regionCode, st.page, slice.from, slice.to)
+    sliceLabel: slice.label + (town && !slice.town ? ' (town ' + town + ')' : ''),
+    targetUrl: buildSearchUrl(st.regionCode, st.page, slice.from, slice.to, town)
   })
 };
 `, { forEach: true }),
