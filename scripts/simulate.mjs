@@ -111,17 +111,30 @@ const C = {
   both: { slug: 'delta-valandovo', code: 'DDDD4444', name: 'ДЕЛТА ДООЕЛ Валандово', addr: 'ул. 4, Валандово', edb: '4029000000004', emp: 2, rev: '750.000' }
 };
 
-/** Southeast (r=7): 2 pages. East (r=2): 1 page. Then empty. */
+/**
+ * Honours the employee range in the URL, so slicing is genuinely exercised:
+ * Southeast holds ГАМА(1), ДЕЛТА(2), АЛФА(3); East holds ДЕЛТА(2), БЕТА(5).
+ * A slice whose headcount nobody has returns an empty page — which is normal.
+ */
 function mockSearch(url) {
   const region = (url.match(/[&?]r=(\d+)/) || [])[1];
   const page = parseInt((url.match(/[&?]p=(\d+)/) || [])[1] || '1', 10);
-  if (region === '7') {
-    if (page === 1) return { statusCode: 200, body: searchPage([C.a, C.both]) };
-    if (page === 2) return { statusCode: 200, body: searchPage([C.c]) };
-    return { statusCode: 200, body: searchPage([]) };
-  }
-  if (page === 1) return { statusCode: 200, body: searchPage([C.b, C.both]) };
+  const from = parseInt((url.match(/dsm\[1\]\.From=(\d+)/) || [])[1] || '1', 10);
+  const to   = parseInt((url.match(/dsm\[1\]\.To=(\d+)/) || [])[1] || '5', 10);
+
+  const pool = (region === '7' ? [C.a, C.both, C.c] : [C.b, C.both])
+    .filter(c => c.emp >= from && c.emp <= to);
+
+  if (page === 1 && pool.length) return { statusCode: 200, body: searchPage(pool, pool.length) };
   return { statusCode: 200, body: searchPage([]) };
+}
+
+/** Employee filters used across a run, e.g. ["1-1","2-2",...]. */
+function sliceFilters(requests) {
+  return [...new Set(requests.map(u => {
+    const m = u.match(/dsm\[1\]\.From=(\d+)&dsm\[1\]\.To=(\d+)/);
+    return m ? m[1] + '-' + m[2] : '?';
+  }))];
 }
 
 const PROFILE_HTML = `<html><body>
@@ -226,12 +239,16 @@ function runWorkflow(opts) {
 console.log('--- Run 1: Southeast (r=7) ---');
 const run1 = runWorkflow({ regionCode: 7, regionName: 'Southeast' });
 
-eq('R1: search requests (2 pages + 1 empty)', run1.searchRequests.length, 3);
+// 5 slices. Three hold a company (page 1 + a terminating empty page 2);
+// two hold none (a single empty page 1). 3*2 + 2*1 = 8.
+eq('R1: one search per employee slice', sliceFilters(run1.searchRequests),
+  ['1-1', '2-2', '3-3', '4-4', '5-5']);
+eq('R1: search requests across all slices', run1.searchRequests.length, 8);
 ok('R1: page 1 has no p= param', !/[&?]p=/.test(run1.searchRequests[0]), run1.searchRequests[0]);
 ok('R1: page 2 requested', /[&?]p=2/.test(run1.searchRequests[1]), run1.searchRequests[1]);
 ok('R1: only region 7 queried', run1.searchRequests.every(u => /[&?]r=7/.test(u)));
-ok('R1: employee filter 1-5 on every request',
-  run1.searchRequests.every(u => u.includes('dsm[1].Code=48&dsm[1].From=1&dsm[1].To=5')));
+ok('R1: every URL narrows to a single headcount',
+  run1.searchRequests.every(u => /dsm\[1\]\.Code=48&dsm\[1\]\.From=(\d)&dsm\[1\]\.To=\1/.test(u)));
 ok('R1: industry filter left empty', run1.searchRequests.every(u => u.includes('&at=&')));
 
 eq('R1: rows written', run1.sheet.length, 3);
@@ -259,7 +276,8 @@ eq('R1: 18 columns on every row', run1.sheet.every(r => Object.keys(r).length ==
 
 eq('R1: summary region', run1.summary.region, 'Southeast (r=7)');
 eq('R1: summary companies found', run1.summary.companiesFoundThisRegion, 3);
-eq('R1: summary request count', run1.summary.scrapingBeeRequests, 3 + 6);
+eq('R1: summary request count', run1.summary.scrapingBeeRequests, 8 + 6);
+eq('R1: per-slice breakdown reported', run1.summary.searchSlices.length, 5);
 eq('R1: no crawl errors', run1.summary.crawlErrors, ['none']);
 ok('R1: summary tells you the next region', /code: 2/.test(run1.summary.NEXT_STEP), run1.summary.NEXT_STEP);
 
@@ -271,7 +289,7 @@ console.log('--- Run 2: East (r=2), same sheet ---');
 const run2 = runWorkflow({ regionCode: 2, regionName: 'East', sheet: run1.sheet });
 
 ok('R2: only region 2 queried', run2.searchRequests.every(u => /[&?]r=2/.test(u)));
-eq('R2: search requests (1 page + 1 empty)', run2.searchRequests.length, 2);
+eq('R2: one search per employee slice', sliceFilters(run2.searchRequests).length, 5);
 
 // C.both was already found in run 1; only C.b is new.
 eq('R2: total rows after both runs (no duplicates)', run2.sheet.length, 4);
@@ -379,8 +397,8 @@ const repeatedAcrossPages = runWorkflow({
   }
 });
 eq('cross-page: repeated company counted once', repeatedAcrossPages.sheet.length, 3);
-eq('cross-page: pagination still advanced past the overlap',
-  repeatedAcrossPages.searchRequests.length, 3);
+ok('cross-page: pagination still advanced past the overlap',
+  repeatedAcrossPages.searchRequests.some(u => /[&?]p=2/.test(u)));
 
 /* ================================================================== *
  * Failure modes
@@ -396,15 +414,15 @@ const truncated = runWorkflow({
     const page = parseInt((url.match(/[&?]p=(\d+)/) || [])[1] || '1', 10);
     if (page === 1) return { statusCode: 200, body: searchPage([C.a, C.b], 850) };
     if (page === 2) return { statusCode: 200, body: searchPage([C.c], 850) };
-    return { statusCode: 200, body: searchPage([], 850) }; // site stops serving
+    return { statusCode: 200, body: searchPage([]) }; // site stops serving
   }
 });
-eq('truncated: site total captured', truncated.summary.siteReportedTotal, 850);
-eq('truncated: collected far fewer', truncated.summary.companiesFoundThisRegion, 3);
-ok('truncated: warning raised', /pagination stopped early/i.test(truncated.summary.WARNING_TRUNCATED || ''),
+ok('truncated: site total captured per slice',
+  truncated.summary.searchSlices.some(l => /site reported 850/.test(l)),
+  JSON.stringify(truncated.summary.searchSlices));
+ok('truncated: warning raised', /paging ceiling/i.test(truncated.summary.WARNING_TRUNCATED || ''),
   truncated.summary.WARNING_TRUNCATED);
-ok('truncated: warning names both numbers',
-  /850/.test(truncated.summary.WARNING_TRUNCATED) && /only 3/.test(truncated.summary.WARNING_TRUNCATED));
+ok('truncated: warning names the shortfall', /850/.test(truncated.summary.WARNING_TRUNCATED));
 
 const notTruncated = runWorkflow({
   regionCode: 7, regionName: 'Southeast', fetchDetails: false,
@@ -412,7 +430,7 @@ const notTruncated = runWorkflow({
     ? { statusCode: 200, body: searchPage([], 2) }
     : { statusCode: 200, body: searchPage([C.a, C.b], 2) }
 });
-eq('small region: total matches what we collected', notTruncated.summary.siteReportedTotal, 2);
+ok('small region: total captured', notTruncated.summary.searchSlices.some(l => /site reported/.test(l)));
 ok('small region: no false truncation warning', !notTruncated.summary.WARNING_TRUNCATED,
   notTruncated.summary.WARNING_TRUNCATED);
 
@@ -446,8 +464,12 @@ const realChallenge = runWorkflow({
 });
 eq('real challenge: no rows', realChallenge.sheet.length, 0);
 ok('real challenge: reported as blocked',
-  realChallenge.summary.crawlErrors.some(e => /BLOCKED on page 1/.test(e)),
+  realChallenge.summary.crawlErrors.some(e => /BLOCKED on .* page 1/.test(e)),
   JSON.stringify(realChallenge.summary.crawlErrors));
+eq('real challenge: abandons the run instead of trying every slice',
+  realChallenge.summary.crawlErrors.filter(e => /BLOCKED/.test(e)).length, 1);
+ok('real challenge: says the region is incomplete',
+  /INCOMPLETE/.test(realChallenge.summary.WARNING_ABORTED || ''));
 ok('real challenge: tells the user the remedy',
   realChallenge.summary.crawlErrors.some(e => /premiumProxy/.test(e)));
 
@@ -456,11 +478,11 @@ const emptyPage1 = runWorkflow({
   regionCode: 7, regionName: 'Southeast', fetchDetails: false,
   searchFetch: () => ({ statusCode: 200, body: searchPage([]) })
 });
-ok('empty page 1: reports byte count and flags',
-  emptyPage1.summary.crawlErrors.some(e => /no company rows were parsed/.test(e)),
-  JSON.stringify(emptyPage1.summary.crawlErrors));
-ok('empty page 1: does NOT claim a block',
+ok('empty region: reports byte count and flags',
+  /HTTP 200/.test(emptyPage1.summary.WARNING_EMPTY || ''), emptyPage1.summary.WARNING_EMPTY);
+ok('empty region: does NOT claim a block',
   !emptyPage1.summary.crawlErrors.some(e => /BLOCKED/.test(e)));
+eq('empty region: an empty slice alone is not an error', emptyPage1.summary.crawlErrors, ['none']);
 
 console.log('--- 403 on search ---');
 const blocked = runWorkflow({
@@ -473,7 +495,9 @@ const blocked = runWorkflow({
 });
 ok('403: logged', blocked.summary.crawlErrors.some(e => /BLOCKED 403/.test(e)),
   JSON.stringify(blocked.summary.crawlErrors));
-ok('403: not retried', blocked.searchRequests.filter(u => /[&?]p=2/.test(u)).length === 1);
+eq('403: abandons the run, does not try the remaining slices',
+  blocked.searchRequests.filter(u => /[&?]p=2/.test(u)).length, 1);
+ok('403: flags the region as incomplete', /INCOMPLETE/.test(blocked.summary.WARNING_ABORTED || ''));
 eq('403: rows found before the block are kept', blocked.sheet.length, 2);
 ok('403: remedy suggested', blocked.summary.crawlErrors.some(e => /premiumProxy/.test(e)));
 
@@ -482,7 +506,7 @@ const repeat = runWorkflow({
   regionCode: 7, regionName: 'Southeast',
   searchFetch: () => ({ statusCode: 200, body: searchPage([C.a]) })  // same page forever
 });
-eq('repeat: stops once nothing new arrives', repeat.searchRequests.length, 2);
+eq('repeat: stops once nothing new arrives, per slice', repeat.searchRequests.length, 10);
 eq('repeat: single row', repeat.sheet.length, 1);
 
 console.log('--- maxPages guard ---');
@@ -493,7 +517,7 @@ const capped = runWorkflow({
     return { statusCode: 200, body: searchPage(page < 5 ? [{ ...C.a, code: 'X' + page, slug: 's' + page }] : []) };
   }
 });
-eq('maxPages: stops at the cap', capped.searchRequests.length, 1);
+eq('maxPages: stops at the cap, per slice', capped.searchRequests.length, 5);
 ok('maxPages: warns about truncation', capped.summary.crawlErrors.some(e => /maxPages/.test(e)));
 
 console.log('--- blocked /lica must still write the row ---');
@@ -513,7 +537,8 @@ const junk = runWorkflow({
 });
 eq('junk: records kept', junk.sheet.length, 3);
 ok('junk: profile URL retained for manual review', !!junk.sheet[0]['Profile URL']);
-eq('junk: list fields retained', junk.sheet[0]['Company Name'], 'АЛФА ДООЕЛ Штип');
+ok('junk: list fields retained', junk.sheet.some(r => r['Company Name'] === 'АЛФА ДООЕЛ Штип'),
+  JSON.stringify(junk.sheet.map(r => r['Company Name'])));
 ok('junk: notes explain the miss', /NO_PHONE_FOUND/.test(junk.sheet[0]['Notes']), junk.sheet[0]['Notes']);
 ok('junk: summary flags the lica parser', /lica parser/i.test(junk.summary.WARNING_LICA || ''),
   junk.summary.WARNING_LICA);
@@ -526,25 +551,26 @@ console.log('--- config switches ---');
 const listOnly = runWorkflow({ regionCode: 7, regionName: 'Southeast', fetchDetails: false });
 eq('fetchDetails=false: no detail requests', listOnly.detailRequests.length, 0);
 eq('fetchDetails=false: list rows still written', listOnly.sheet.length, 3);
-eq('fetchDetails=false: list fields present', listOnly.sheet[0]['Employees'], 3);
+eq('fetchDetails=false: list fields present',
+  listOnly.sheet.find(r => r['Company Name'] === 'АЛФА ДООЕЛ Штип')['Employees'], 3);
 eq('fetchDetails=false: detail columns blank', listOnly.sheet[0]['Phones'], '');
 ok('fetchDetails=false: summary says why', /fetchDetails is false/.test(listOnly.summary.detailPassSkipped || ''),
   listOnly.summary.detailPassSkipped);
 
 const trial = runWorkflow({ regionCode: 7, regionName: 'Southeast', maxPages: 1, maxCompanies: 2 });
-eq('trial run: one search page', trial.searchRequests.length, 1);
+eq('trial run: one search page per slice', trial.searchRequests.length, 5);
 eq('trial run: two companies enriched (4 requests)', trial.detailRequests.length, 4);
-eq('trial run: total requests as advertised', trial.summary.scrapingBeeRequests, 1 + 4);
+eq('trial run: total requests as advertised', trial.summary.scrapingBeeRequests, 5 + 4);
 
 // A company held back by the cap must stay pending, and be picked up next run.
 const capped1 = runWorkflow({ regionCode: 7, regionName: 'Southeast', maxPages: 1, maxCompanies: 1 });
 eq('cap: only one company enriched', capped1.detailRequests.length, 2);
-eq('cap: the other stays pending', capped1.sheet.filter(r => r['Detail Fetched'] !== 'yes').length, 1);
+eq('cap: the others stay pending', capped1.sheet.filter(r => r['Detail Fetched'] !== 'yes').length, 2);
 
 const capped2 = runWorkflow({ regionCode: 7, regionName: 'Southeast', maxPages: 1, sheet: capped1.sheet });
-eq('cap: next run picks up exactly the pending one', capped2.detailRequests.length, 2);
+eq('cap: next run picks up the remaining pending ones', capped2.detailRequests.length, 4);
 eq('cap: nothing left pending afterwards', capped2.sheet.filter(r => r['Detail Fetched'] !== 'yes').length, 0);
-eq('cap: no duplicate rows across the two runs', capped2.sheet.length, 2);
+eq('cap: no duplicate rows across the two runs', capped2.sheet.length, 3);
 
 /* ================================================================== */
 

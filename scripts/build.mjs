@@ -303,7 +303,13 @@ const sheetName     = 'Companies';                     // tab name
 //      Run Summary node, tune lib/parsers.js if anything is wrong.
 // FULL RUN:
 //     maxPages: 300, maxCompanies: 0
-const maxPages     = 300; // safety stop for the pagination loop
+// The search stops serving results past a certain depth (a live run capped out
+// at 60 companies for a whole region). Splitting the employee filter into one
+// search per value multiplies that ceiling and is why a full region comes back.
+// Set to false only to reproduce the old single-query behaviour.
+const splitByEmployeeCount = true;
+
+const maxPages     = 300; // safety stop, per slice
 const maxCompanies = 0;   // 0 = every company found; otherwise cap the detail pass
 const fetchDetails = true; // false = list fields only, no profile/lica requests
 
@@ -315,6 +321,7 @@ return [{
     maxPages,
     maxCompanies,
     fetchDetails,
+    splitByEmployeeCount,
 
     employeesFrom: 1,
     employeesTo: 5,
@@ -348,31 +355,55 @@ function buildWorkflow() {
     sheetsRead('Read Existing Sheet', [-680, 300]),
     codeNode('Seed State', [-460, 300], `
 // Seeds the pagination crawl for the single region set in Config.
+//
+// The search will only page so deep before it stops serving results — a live
+// run collected exactly 60 companies (3 pages x 20) for a whole region, which
+// is a ceiling, not a real total. You cannot page past it, but you can go
+// around it: several narrower searches each stay under the ceiling, and their
+// union is the full set. The employee filter is the natural axis, since a
+// company has exactly one employee count, so the slices do not overlap.
+//
 // Previously-written rows are NOT copied into this item — the crawl state is
 // carried through every loop iteration, so it is kept small. Prepare Companies
 // reads them straight from $('Read Existing Sheet') instead.
 const cfg = $('Config').first().json;
 
+const from = Number(cfg.employeesFrom);
+const to   = Number(cfg.employeesTo);
+
+let slices;
+if (cfg.splitByEmployeeCount) {
+  slices = [];
+  for (let n = from; n <= to; n++) slices.push({ from: n, to: n, label: n + ' employees' });
+} else {
+  slices = [{ from: from, to: to, label: from + '-' + to + ' employees' }];
+}
+
 return [{
   json: {
     regionCode: cfg.region.code,
     regionName: cfg.region.name,
+    slices,
+    sliceIdx: 0,
     page: 1,
     companies: [],
     seen: [],
     errors: [],
     pagesFetched: 0,
+    perSlice: [],
+    sliceRows: 0,
     totalReported: null
   }
 }];
 `),
     codeNode('Build Search URL', [-240, 300], `
-const cfg = $('Config').first().json;
-const st  = $input.item.json;
+const st = $input.item.json;
+const slice = st.slices[st.sliceIdx];
 
 return {
   json: Object.assign({}, st, {
-    targetUrl: buildSearchUrl(st.regionCode, st.page, cfg.employeesFrom, cfg.employeesTo)
+    sliceLabel: slice.label,
+    targetUrl: buildSearchUrl(st.regionCode, st.page, slice.from, slice.to)
   })
 };
 `, { forEach: true }),
@@ -388,8 +419,16 @@ const html = String(resp.body == null ? (resp.data == null ? '' : resp.data) : r
 
 const errors = (st.errors || []).slice();
 const seen   = new Set(st.seen || []);
+const perSlice = (st.perSlice || []).slice();
+const slice = st.slices[st.sliceIdx];
 let totalReported = st.totalReported == null ? null : st.totalReported;
 let companies = (st.companies || []).slice();
+let sliceRows = st.sliceRows || 0;
+let lastEmptyDiagnostic = st.lastEmptyDiagnostic || '';
+// A block is about US, not about this slice. Continuing through the remaining
+// slices would be four more requests at a site that just refused one — exactly
+// the hammering the rate-limit rules forbid. Abandon the whole run instead.
+let abortAll = false;
 
 let stop = false;
 let pageRows = 0;
@@ -399,10 +438,11 @@ let healthFlags = [];
 // The brief is explicit: on 403/429 stop and log. Do NOT retry in a loop —
 // that is how a soft block becomes a hard one.
 if (statusCode === 403 || statusCode === 429) {
-  errors.push('BLOCKED ' + statusCode + ' on page ' + st.page + ' — stopped. Try a higher waitSeconds, or premiumProxy: true.');
+  errors.push('BLOCKED ' + statusCode + ' on ' + slice.label + ' page ' + st.page + ' — abandoned the whole run rather than retry. Raise waitSeconds, or set premiumProxy: true.');
   stop = true;
+  abortAll = true;
 } else if (statusCode >= 400 || !html) {
-  errors.push('HTTP ' + statusCode + ' on page ' + st.page + ' — stopped.');
+  errors.push('HTTP ' + statusCode + ' on ' + slice.label + ' page ' + st.page + ' — stopped.');
   stop = true;
 } else {
   healthFlags = diagnoseResponse(html);
@@ -419,14 +459,19 @@ if (statusCode === 403 || statusCode === 429) {
   // "pagination stopped early" — the two look identical from the row counts.
   if (parsed.total != null && totalReported == null) totalReported = parsed.total;
 
-  const fresh = parsed.rows.filter(r => r.profileUrl && !seen.has(r.profileUrl));
+  // Keyed per slice: the stop signal is "this slice served nothing new".
+  // Cross-slice duplicates are handled later by dedupeCompanies.
+  const key = r => st.sliceIdx + '|' + r.profileUrl;
+
+  const fresh = parsed.rows.filter(r => r.profileUrl && !seen.has(key(r)));
   fresh.forEach(r => {
-    seen.add(r.profileUrl);
+    seen.add(key(r));
     r.region = st.regionName;
     r.regionCode = st.regionCode;
     companies.push(r);
   });
   newRows = fresh.length;
+  sliceRows += newRows;
 
   if (pageRows && !parsed.rowsWithEdb) {
     errors.push('Page ' + st.page + ': parsed ' + pageRows + ' rows but none had a ЕДБ — row parsing needs tuning. Save the HTML into tests/fixtures/ and run npm test.');
@@ -436,34 +481,60 @@ if (statusCode === 403 || statusCode === 429) {
   // the site clamping pagination by repeating the last page.
   if (newRows === 0) stop = true;
 
-  // Page 1 coming back with zero rows is never normal — say why.
+  // An empty slice is ordinary — no company in this region has exactly this
+  // headcount. Only a challenge page is worth reporting here; "the whole region
+  // came back empty" is diagnosed once, in Run Summary.
   if (st.page === 1 && pageRows === 0) {
     const blocking = healthFlags.filter(isBlockingFlag);
     if (blocking.length) {
-      errors.push('BLOCKED on page 1 (' + blocking.join(',') + ') — the site served a challenge page instead of results. Set premiumProxy: true and run again.');
-    } else {
-      errors.push('Page 1 returned HTTP 200 (' + html.length + ' bytes) but no company rows were parsed. Either this region has no companies matching the filter, or the row parser needs tuning. Flags: ' + (healthFlags.join(',') || 'none') + '.');
+      errors.push('BLOCKED on ' + slice.label + ' page 1 (' + blocking.join(',') + ') — the site served a challenge page instead of results. Abandoned the run. Set premiumProxy: true and try again.');
+      abortAll = true;
     }
+    lastEmptyDiagnostic = slice.label + ': HTTP 200, ' + html.length + ' bytes, flags: ' + (healthFlags.join(',') || 'none');
   }
 
   if (st.page >= cfg.maxPages) {
-    errors.push('Hit maxPages (' + cfg.maxPages + ') — results may be truncated. Raise it if the region is bigger than this.');
+    errors.push(slice.label + ': hit maxPages (' + cfg.maxPages + ') — results may be truncated. Raise it.');
     stop = true;
   }
+}
+
+// "stop" ends the current SLICE, not the crawl. Move to the next one; the run
+// is finished only when every slice is exhausted.
+let sliceIdx = st.sliceIdx;
+let page = st.page + 1;
+
+if (stop) {
+  perSlice.push({
+    slice: slice.label,
+    companies: sliceRows,
+    pages: st.page,
+    siteReportedTotal: totalReported
+  });
+  sliceIdx = st.sliceIdx + 1;
+  page = 1;
+  sliceRows = 0;
+  totalReported = null; // each slice reports its own total
 }
 
 return {
   json: {
     regionCode: st.regionCode,
     regionName: st.regionName,
-    page: stop ? st.page : st.page + 1,
+    slices: st.slices,
+    sliceIdx,
+    page,
     companies,
     seen: Array.from(seen),
     errors,
     pagesFetched: (st.pagesFetched || 0) + 1,
+    perSlice,
+    sliceRows,
+    lastEmptyDiagnostic,
     totalReported,
-    hasMore: !stop,
-    lastPage: { page: st.page, rows: pageRows, newRows, statusCode, htmlLength: html.length, healthFlags }
+    aborted: abortAll || !!st.aborted,
+    hasMore: !abortAll && sliceIdx < st.slices.length,
+    lastPage: { slice: slice.label, page: st.page, rows: pageRows, newRows, statusCode, htmlLength: html.length, healthFlags }
   }
 };
 `, { forEach: true }),
@@ -658,7 +729,9 @@ const newThisRun = prepared.filter(r => String(r['Detail Fetched'] || '').toLowe
 const summary = {
   region: cfg.region.name + ' (r=' + cfg.region.code + ')',
   searchPagesFetched: crawl.pagesFetched,
-  siteReportedTotal: crawl.totalReported == null ? 'not printed on the page' : crawl.totalReported,
+  searchSlices: (crawl.perSlice || []).map(s =>
+    s.slice + ': ' + s.companies + ' companies over ' + s.pages + ' pages'
+    + (s.siteReportedTotal == null ? '' : ' (site reported ' + s.siteReportedTotal + ')')),
   companiesFoundThisRegion: prepared.length,
   alreadyEnrichedFromPreviousRun: prepared.length - newThisRun,
   companiesEnrichedThisRun: enriched.length,
@@ -688,10 +761,24 @@ if (blocked.length) {
   summary.WARNING = blocked.length + ' request(s) were blocked (403/429). Raise waitSeconds or set premiumProxy: true, then run again — already-enriched rows are skipped automatically.';
 }
 
-// Collecting far fewer companies than the site says exist means pagination
-// stopped early — a cap on anonymous paging, or a changed page parameter.
-if (typeof crawl.totalReported === 'number' && crawl.totalReported > prepared.length * 1.1) {
-  summary.WARNING_TRUNCATED = 'The site reports ' + crawl.totalReported + ' results for this region but only ' + prepared.length + ' were collected, over ' + crawl.pagesFetched + ' pages. Pagination stopped early — open the search URL with &p=' + (crawl.pagesFetched) + ' in a browser to see whether more results exist.';
+// A slice that collects far fewer than the site says exist has hit the paging
+// ceiling and needs splitting further (by town, or by revenue band).
+const short = (crawl.perSlice || []).filter(s =>
+  typeof s.siteReportedTotal === 'number' && s.siteReportedTotal > s.companies * 1.1);
+if (crawl.aborted) {
+  summary.WARNING_ABORTED = 'The run was abandoned partway because the site blocked a request, so this region is INCOMPLETE. Fix the cause above and run again — everything already collected is kept and will not be re-scraped.';
+}
+
+if (!prepared.length) {
+  summary.WARNING_EMPTY = 'No companies were collected at all. Last empty response: '
+    + (crawl.lastEmptyDiagnostic || 'n/a')
+    + '. If the byte count looks like a real page, the row parser needs tuning — save the HTML into tests/fixtures/ and run npm test.';
+}
+
+if (short.length) {
+  summary.WARNING_TRUNCATED = short.map(s =>
+    s.slice + ': site reports ' + s.siteReportedTotal + ' but only ' + s.companies + ' were collected'
+  ).join('; ') + '. These searches hit the paging ceiling — they need splitting further to reach the rest.';
 }
 if (enriched.length && has(enriched, 'Owners') === 0 && has(enriched, 'Managers') === 0) {
   summary.WARNING_LICA = 'No owners or managers parsed for ANY company. The /lica parser very likely needs tuning — save a page into tests/fixtures/ and run npm test.';
