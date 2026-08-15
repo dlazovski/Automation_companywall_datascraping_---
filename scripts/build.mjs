@@ -372,7 +372,7 @@ const from = Number(cfg.employeesFrom);
 const to   = Number(cfg.employeesTo);
 
 let slices;
-if (cfg.splitByEmployeeCount) {
+if (cfg.splitByEmployeeCount !== false) {
   slices = [];
   for (let n = from; n <= to; n++) slices.push({ from: n, to: n, label: n + ' employees' });
 } else {
