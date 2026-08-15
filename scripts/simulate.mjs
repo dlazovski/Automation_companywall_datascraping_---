@@ -239,11 +239,12 @@ function runWorkflow(opts) {
 console.log('--- Run 1: Southeast (r=7) ---');
 const run1 = runWorkflow({ regionCode: 7, regionName: 'Southeast' });
 
-// 5 slices. Three hold a company (page 1 + a terminating empty page 2);
-// two hold none (a single empty page 1). 3*2 + 2*1 = 8.
+// 5 slices, and a slice ends only after 3 consecutive unproductive pages.
+// Three slices hold a company (1 productive + 3 empty = 4 requests each);
+// two hold none (3 empty each). 3*4 + 2*3 = 18.
 eq('R1: one search per employee slice', sliceFilters(run1.searchRequests),
   ['1-1', '2-2', '3-3', '4-4', '5-5']);
-eq('R1: search requests across all slices', run1.searchRequests.length, 8);
+eq('R1: search requests across all slices', run1.searchRequests.length, 18);
 ok('R1: page 1 has no p= param', !/[&?]p=/.test(run1.searchRequests[0]), run1.searchRequests[0]);
 ok('R1: page 2 requested', /[&?]p=2/.test(run1.searchRequests[1]), run1.searchRequests[1]);
 ok('R1: only region 7 queried', run1.searchRequests.every(u => /[&?]r=7/.test(u)));
@@ -276,7 +277,7 @@ eq('R1: 18 columns on every row', run1.sheet.every(r => Object.keys(r).length ==
 
 eq('R1: summary region', run1.summary.region, 'Southeast (r=7)');
 eq('R1: summary companies found', run1.summary.companiesFoundThisRegion, 3);
-eq('R1: summary request count', run1.summary.scrapingBeeRequests, 8 + 6);
+eq('R1: summary request count', run1.summary.scrapingBeeRequests, 18 + 6);
 eq('R1: per-slice breakdown reported', run1.summary.searchSlices.length, 5);
 eq('R1: no crawl errors', run1.summary.crawlErrors, ['none']);
 ok('R1: summary tells you the next region', /code: 2/.test(run1.summary.NEXT_STEP), run1.summary.NEXT_STEP);
@@ -404,6 +405,24 @@ ok('cross-page: pagination still advanced past the overlap',
  * Failure modes
  * ================================================================== */
 
+console.log('--- one blank page mid-crawl must not end the crawl ---');
+// The live search really has 239 pages. If a single hiccup ended the crawl,
+// thousands of companies would be lost silently.
+const blip = runWorkflow({
+  regionCode: 7, regionName: 'Southeast', fetchDetails: false,
+  searchFetch: (url) => {
+    const page = parseInt((url.match(/[&?]p=(\d+)/) || [])[1] || '1', 10);
+    const from = parseInt((url.match(/dsm\[1\]\.From=(\d+)/) || [])[1] || '1', 10);
+    if (from !== 1) return { statusCode: 200, body: searchPage([]) };
+    if (page === 1) return { statusCode: 200, body: searchPage([C.c]) };
+    if (page === 2) return { statusCode: 200, body: searchPage([]) };      // the blip
+    if (page === 3) return { statusCode: 200, body: searchPage([C.a]) };   // recovers
+    return { statusCode: 200, body: searchPage([]) };
+  }
+});
+eq('blip: kept going past the blank page and collected both', blip.sheet.length, 2);
+ok('blip: reached page 3', blip.searchRequests.some(u => /[&?]p=3/.test(u)));
+
 console.log('--- pagination cut short vs. a genuinely small region ---');
 // The site says there are 850 results, we only collected 3 pages' worth.
 // That is indistinguishable from a small region unless we read the site's own
@@ -506,7 +525,7 @@ const repeat = runWorkflow({
   regionCode: 7, regionName: 'Southeast',
   searchFetch: () => ({ statusCode: 200, body: searchPage([C.a]) })  // same page forever
 });
-eq('repeat: stops once nothing new arrives, per slice', repeat.searchRequests.length, 10);
+eq('repeat: stops once nothing new arrives, per slice', repeat.searchRequests.length, 20);
 eq('repeat: single row', repeat.sheet.length, 1);
 
 console.log('--- maxPages guard ---');

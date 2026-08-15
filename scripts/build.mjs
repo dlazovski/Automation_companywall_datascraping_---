@@ -323,7 +323,7 @@ const towns = [
 ];
 
 // Simpler alternative to the list above: set ONE town code here and run once
-// per town, changing only this line. Ignored when `towns` is populated.
+// per town, changing only this line. Ignored when the towns list above is used.
 const townCode = '';
 
 const maxPages     = 300; // safety stop, per slice
@@ -469,6 +469,11 @@ let totalReported = st.totalReported == null ? null : st.totalReported;
 let companies = (st.companies || []).slice();
 let sliceRows = st.sliceRows || 0;
 let lastEmptyDiagnostic = st.lastEmptyDiagnostic || '';
+// One unproductive page used to end the crawl. Against a search that really has
+// 239 pages, a single blip — a hiccup, a repeated response — would silently cost
+// thousands of companies. Require a few in a row before believing it.
+let emptyStreak = st.emptyStreak || 0;
+const EMPTY_STREAK_LIMIT = 3;
 // A block is about US, not about this slice. Continuing through the remaining
 // slices would be four more requests at a site that just refused one — exactly
 // the hammering the rate-limit rules forbid. Abandon the whole run instead.
@@ -521,9 +526,13 @@ if (statusCode === 403 || statusCode === 429) {
     errors.push('Page ' + st.page + ': parsed ' + pageRows + ' rows but none had a ЕДБ — row parsing needs tuning. Save the HTML into tests/fixtures/ and run npm test.');
   }
 
-  // Exhausted when a page brings nothing new. Covers both an empty page and
-  // the site clamping pagination by repeating the last page.
-  if (newRows === 0) stop = true;
+  // Exhausted only after several consecutive pages bring nothing new.
+  if (newRows === 0) {
+    emptyStreak += 1;
+    if (emptyStreak >= EMPTY_STREAK_LIMIT) stop = true;
+  } else {
+    emptyStreak = 0;
+  }
 
   // An empty slice is ordinary — no company in this region has exactly this
   // headcount. Only a challenge page is worth reporting here; "the whole region
@@ -552,12 +561,13 @@ if (stop) {
   perSlice.push({
     slice: slice.label,
     companies: sliceRows,
-    pages: st.page,
+    pages: Math.max(1, st.page - emptyStreak),
     siteReportedTotal: totalReported
   });
   sliceIdx = st.sliceIdx + 1;
   page = 1;
   sliceRows = 0;
+  emptyStreak = 0;
   totalReported = null; // each slice reports its own total
 }
 
@@ -575,6 +585,7 @@ return {
     perSlice,
     sliceRows,
     lastEmptyDiagnostic,
+    emptyStreak,
     totalReported,
     aborted: abortAll || !!st.aborted,
     hasMore: !abortAll && sliceIdx < st.slices.length,
