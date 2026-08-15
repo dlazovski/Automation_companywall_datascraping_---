@@ -376,6 +376,52 @@ eq('cross-page: pagination still advanced past the overlap',
  * Failure modes
  * ================================================================== */
 
+console.log('--- reCAPTCHA script on a good page must NOT abort ---');
+// Regression: CompanyWall loads reCAPTCHA for its own login form, so the string
+// appears in ordinary search pages. Treating that as a block aborted a working
+// run before the parser ever executed.
+const recaptchaNoise = runWorkflow({
+  regionCode: 7, regionName: 'Southeast', fetchDetails: false,
+  searchFetch: (url) => {
+    const page = parseInt((url.match(/[&?]p=(\d+)/) || [])[1] || '1', 10);
+    const body = (page === 1 ? searchPage([C.a, C.b]) : searchPage([]))
+      .replace('<body>', '<body><script src="https://www.google.com/recaptcha/api.js"></script>'
+        + '<div class="g-recaptcha" data-sitekey="abc"></div>');
+    return { statusCode: 200, body };
+  }
+});
+eq('recaptcha noise: rows still parsed', recaptchaNoise.sheet.length, 2);
+eq('recaptcha noise: no error raised', recaptchaNoise.summary.crawlErrors, ['none']);
+eq('recaptcha noise: companies counted', recaptchaNoise.summary.companiesFoundThisRegion, 2);
+
+console.log('--- a genuine challenge page IS still caught ---');
+const realChallenge = runWorkflow({
+  regionCode: 7, regionName: 'Southeast', fetchDetails: false,
+  // No site content at all — the challenge is served instead of the page.
+  searchFetch: () => ({
+    statusCode: 200,
+    body: '<html><body><h1>Just a moment…</h1><div class="g-recaptcha"></div>'
+      + '<p>Checking your browser before accessing.</p></body></html>'
+  })
+});
+eq('real challenge: no rows', realChallenge.sheet.length, 0);
+ok('real challenge: reported as blocked',
+  realChallenge.summary.crawlErrors.some(e => /BLOCKED on page 1/.test(e)),
+  JSON.stringify(realChallenge.summary.crawlErrors));
+ok('real challenge: tells the user the remedy',
+  realChallenge.summary.crawlErrors.some(e => /premiumProxy/.test(e)));
+
+console.log('--- empty page 1 with no challenge is explained, not blamed on a block ---');
+const emptyPage1 = runWorkflow({
+  regionCode: 7, regionName: 'Southeast', fetchDetails: false,
+  searchFetch: () => ({ statusCode: 200, body: searchPage([]) })
+});
+ok('empty page 1: reports byte count and flags',
+  emptyPage1.summary.crawlErrors.some(e => /no company rows were parsed/.test(e)),
+  JSON.stringify(emptyPage1.summary.crawlErrors));
+ok('empty page 1: does NOT claim a block',
+  !emptyPage1.summary.crawlErrors.some(e => /BLOCKED/.test(e)));
+
 console.log('--- 403 on search ---');
 const blocked = runWorkflow({
   regionCode: 7, regionName: 'Southeast',

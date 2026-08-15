@@ -404,33 +404,44 @@ if (statusCode === 403 || statusCode === 429) {
   stop = true;
 } else {
   healthFlags = diagnoseResponse(html);
-  if (healthFlags.indexOf('CLOUDFLARE_CHALLENGE') >= 0 || healthFlags.indexOf('CAPTCHA') >= 0) {
-    errors.push('CHALLENGE on page ' + st.page + ' (' + healthFlags.join(',') + ') — stopped. Set premiumProxy: true.');
+
+  // Always parse. Health flags alone are NOT grounds to abort: the site loads
+  // reCAPTCHA on its own login form, so challenge-looking strings appear in
+  // perfectly good pages. Getting rows back is the only proof that matters, so
+  // the flags are consulted below only to explain an empty result.
+  const parsed = parseSearchResults(html);
+  pageRows = parsed.rows.length;
+
+  const fresh = parsed.rows.filter(r => r.profileUrl && !seen.has(r.profileUrl));
+  fresh.forEach(r => {
+    seen.add(r.profileUrl);
+    r.region = st.regionName;
+    r.regionCode = st.regionCode;
+    companies.push(r);
+  });
+  newRows = fresh.length;
+
+  if (pageRows && !parsed.rowsWithEdb) {
+    errors.push('Page ' + st.page + ': parsed ' + pageRows + ' rows but none had a ЕДБ — row parsing needs tuning. Save the HTML into tests/fixtures/ and run npm test.');
+  }
+
+  // Exhausted when a page brings nothing new. Covers both an empty page and
+  // the site clamping pagination by repeating the last page.
+  if (newRows === 0) stop = true;
+
+  // Page 1 coming back with zero rows is never normal — say why.
+  if (st.page === 1 && pageRows === 0) {
+    const blocking = healthFlags.filter(isBlockingFlag);
+    if (blocking.length) {
+      errors.push('BLOCKED on page 1 (' + blocking.join(',') + ') — the site served a challenge page instead of results. Set premiumProxy: true and run again.');
+    } else {
+      errors.push('Page 1 returned HTTP 200 (' + html.length + ' bytes) but no company rows were parsed. Either this region has no companies matching the filter, or the row parser needs tuning. Flags: ' + (healthFlags.join(',') || 'none') + '.');
+    }
+  }
+
+  if (st.page >= cfg.maxPages) {
+    errors.push('Hit maxPages (' + cfg.maxPages + ') — results may be truncated. Raise it if the region is bigger than this.');
     stop = true;
-  } else {
-    const parsed = parseSearchResults(html);
-    pageRows = parsed.rows.length;
-
-    const fresh = parsed.rows.filter(r => r.profileUrl && !seen.has(r.profileUrl));
-    fresh.forEach(r => {
-      seen.add(r.profileUrl);
-      r.region = st.regionName;
-      r.regionCode = st.regionCode;
-      companies.push(r);
-    });
-    newRows = fresh.length;
-
-    if (parsed.rows.length && !parsed.rowsWithEdb) {
-      errors.push('Page ' + st.page + ': parsed ' + parsed.rows.length + ' rows but none had a ЕДБ — row parsing is probably wrong. Check lib/parsers.js.');
-    }
-
-    // Exhausted when a page brings nothing new. Covers both an empty page and
-    // the site clamping pagination by repeating the last page.
-    if (newRows === 0) stop = true;
-    if (st.page >= cfg.maxPages) {
-      errors.push('Hit maxPages (' + cfg.maxPages + ') — results may be truncated. Raise it if the region is bigger than this.');
-      stop = true;
-    }
   }
 }
 
@@ -444,7 +455,7 @@ return {
     errors,
     pagesFetched: (st.pagesFetched || 0) + 1,
     hasMore: !stop,
-    lastPage: { page: st.page, rows: pageRows, newRows, statusCode, healthFlags }
+    lastPage: { page: st.page, rows: pageRows, newRows, statusCode, htmlLength: html.length, healthFlags }
   }
 };
 `, { forEach: true }),
