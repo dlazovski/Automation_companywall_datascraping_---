@@ -565,6 +565,11 @@ if (statusCode === 403 || statusCode === 429) {
   }
 }
 
+// Nothing whatsoever after several complete searches is not an empty filter —
+// it is the site refusing to serve results. Stop there rather than spend the
+// rest of the run (and premium-proxy credits) confirming it 50 more times.
+const DEAD_RUN_AFTER_SLICES = 3;
+
 // "stop" ends the current SLICE, not the crawl. Move to the next one; the run
 // is finished only when every slice is exhausted.
 let sliceIdx = st.sliceIdx;
@@ -582,6 +587,11 @@ if (stop) {
   sliceRows = 0;
   emptyStreak = 0;
   totalReported = null; // each slice reports its own total
+
+  if (companies.length === 0 && sliceIdx >= DEAD_RUN_AFTER_SLICES) {
+    errors.push('STOPPED: ' + sliceIdx + ' complete searches returned nothing at all, last response ' + html.length + ' bytes with no company links. A real empty filter varies in size; an identical canned page every time means the site is not serving us results. This is a block, not a filter problem. Raise waitSeconds, set premiumProxy: true, and try again.');
+    abortAll = true;
+  }
 }
 
 return {

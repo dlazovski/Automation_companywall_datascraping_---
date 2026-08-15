@@ -516,8 +516,11 @@ ok('real challenge: names the byte count so it can be judged',
   JSON.stringify(realChallenge.summary.crawlErrors));
 ok('real challenge: tells the user the remedy',
   realChallenge.summary.crawlErrors.some(e => /premiumProxy/.test(e)));
-eq('real challenge: every slice reported, run not abandoned',
-  realChallenge.summary.crawlErrors.filter(e => /CHALLENGE/.test(e)).length, 5);
+// The dead-run guard stops after 3 fruitless searches rather than all 5.
+eq('real challenge: reported per search until the guard trips',
+  realChallenge.summary.crawlErrors.filter(e => /CHALLENGE/.test(e)).length, 3);
+ok('real challenge: guard explains it is a block, not a filter',
+  realChallenge.summary.crawlErrors.some(e => /STOPPED: 3 complete searches/.test(e)));
 
 console.log('--- empty page 1 with no challenge is explained, not blamed on a block ---');
 const emptyPage1 = runWorkflow({
@@ -528,7 +531,28 @@ ok('empty region: reports byte count and flags',
   /HTTP 200/.test(emptyPage1.summary.WARNING_EMPTY || ''), emptyPage1.summary.WARNING_EMPTY);
 ok('empty region: does NOT claim a block',
   !emptyPage1.summary.crawlErrors.some(e => /BLOCKED/.test(e)));
-eq('empty region: an empty slice alone is not an error', emptyPage1.summary.crawlErrors, ['none']);
+ok('empty region: the guard stops a run that collects nothing at all',
+  emptyPage1.summary.crawlErrors.some(e => /STOPPED: 3 complete searches/.test(e)),
+  JSON.stringify(emptyPage1.summary.crawlErrors));
+ok('empty region: not misreported as a challenge',
+  !emptyPage1.summary.crawlErrors.some(e => /CHALLENGE|BLOCKED/.test(e)));
+
+console.log('--- the dead-run guard must not fire when data is arriving ---');
+// Only the first search finds anything; the remaining four are legitimately
+// empty. The guard must stay quiet, because something WAS collected.
+const sparse = runWorkflow({
+  regionCode: 7, regionName: 'Southeast', fetchDetails: false,
+  searchFetch: (url) => {
+    const from = parseInt((url.match(/dsm\[1\]\.From=(\d+)/) || [])[1] || '1', 10);
+    const page = parseInt((url.match(/[&?]p=(\d+)/) || [])[1] || '1', 10);
+    if (from === 1 && page === 1) return { statusCode: 200, body: searchPage([C.c], 1) };
+    return { statusCode: 200, body: searchPage([]) };
+  }
+});
+eq('sparse: the one company was kept', sparse.sheet.length, 1);
+ok('sparse: guard did not fire', !sparse.summary.crawlErrors.some(e => /STOPPED/.test(e)),
+  JSON.stringify(sparse.summary.crawlErrors));
+eq('sparse: all 5 searches ran', sparse.summary.searchSlices.length, 5);
 
 console.log('--- 403 on search ---');
 const blocked = runWorkflow({
@@ -563,7 +587,7 @@ const capped = runWorkflow({
     return { statusCode: 200, body: searchPage(page < 5 ? [{ ...C.a, code: 'X' + page, slug: 's' + page }] : []) };
   }
 });
-eq('maxPages: stops at the cap, per slice', capped.searchRequests.length, 5);
+eq('maxPages: stops at the cap, per slice', capped.searchRequests.length, 3);
 ok('maxPages: warns about truncation', capped.summary.crawlErrors.some(e => /maxPages/.test(e)));
 
 console.log('--- blocked /lica must still write the row ---');
