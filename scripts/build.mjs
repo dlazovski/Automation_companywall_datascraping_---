@@ -554,8 +554,7 @@ if (statusCode === 403 || statusCode === 429) {
   if (st.page === 1 && pageRows === 0) {
     const blocking = healthFlags.filter(isBlockingFlag);
     if (blocking.length) {
-      errors.push('BLOCKED on ' + slice.label + ' page 1 (' + blocking.join(',') + ') — the site served a challenge page instead of results. Abandoned the run. Set premiumProxy: true and try again.');
-      abortAll = true;
+      errors.push('CHALLENGE on ' + slice.label + ' page 1 (' + blocking.join(',') + ', ' + html.length + ' bytes) — skipping this search and carrying on. If many searches report this, set premiumProxy: true.');
     }
     lastEmptyDiagnostic = slice.label + ': HTTP 200, ' + html.length + ' bytes, flags: ' + (healthFlags.join(',') || 'none');
   }

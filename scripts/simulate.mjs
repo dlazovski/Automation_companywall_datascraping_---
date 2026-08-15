@@ -471,6 +471,32 @@ eq('recaptcha noise: rows still parsed', recaptchaNoise.sheet.length, 2);
 eq('recaptcha noise: no error raised', recaptchaNoise.summary.crawlErrors, ['none']);
 eq('recaptcha noise: companies counted', recaptchaNoise.summary.companiesFoundThisRegion, 2);
 
+console.log('--- a full-size no-results page must not look like a block ---');
+// Regression: an ordinary "nothing matched this filter" page is full-size and
+// carries the site's chrome — a login link and the reCAPTCHA script — but no
+// company links. That was read as a challenge and killed the whole run at the
+// first slice, losing all 60 searches.
+const chrome = 'Најави се Регистрирај се <script src="/recaptcha/api.js"></script>';
+const emptyButReal = runWorkflow({
+  regionCode: 7, regionName: 'Southeast', fetchDetails: false,
+  searchFetch: (url) => {
+    const from = parseInt((url.match(/dsm\[1\]\.From=(\d+)/) || [])[1] || '1', 10);
+    // Headcount 1 returns a full-size page with no results at all.
+    if (from === 1) return { statusCode: 200, body: '<html><body>' + chrome + 'x'.repeat(107000) + '</body></html>' };
+    const page = parseInt((url.match(/[&?]p=(\d+)/) || [])[1] || '1', 10);
+    const pool = [C.a, C.both].filter(c => c.emp === from);
+    if (page === 1 && pool.length) return { statusCode: 200, body: searchPage(pool, pool.length) };
+    return { statusCode: 200, body: searchPage([]) };
+  }
+});
+ok('no-results page: run was NOT aborted', !emptyButReal.summary.WARNING_ABORTED,
+  emptyButReal.summary.WARNING_ABORTED);
+ok('no-results page: later slices still ran and collected',
+  emptyButReal.sheet.length === 2, JSON.stringify(emptyButReal.sheet.map(r => r['Company Name'])));
+ok('no-results page: not reported as a challenge',
+  !emptyButReal.summary.crawlErrors.some(e => /CHALLENGE|BLOCKED/.test(e)),
+  JSON.stringify(emptyButReal.summary.crawlErrors));
+
 console.log('--- a genuine challenge page IS still caught ---');
 const realChallenge = runWorkflow({
   regionCode: 7, regionName: 'Southeast', fetchDetails: false,
@@ -482,15 +508,16 @@ const realChallenge = runWorkflow({
   })
 });
 eq('real challenge: no rows', realChallenge.sheet.length, 0);
-ok('real challenge: reported as blocked',
-  realChallenge.summary.crawlErrors.some(e => /BLOCKED on .* page 1/.test(e)),
+ok('real challenge: reported',
+  realChallenge.summary.crawlErrors.some(e => /CHALLENGE on .* page 1/.test(e)),
   JSON.stringify(realChallenge.summary.crawlErrors));
-eq('real challenge: abandons the run instead of trying every slice',
-  realChallenge.summary.crawlErrors.filter(e => /BLOCKED/.test(e)).length, 1);
-ok('real challenge: says the region is incomplete',
-  /INCOMPLETE/.test(realChallenge.summary.WARNING_ABORTED || ''));
+ok('real challenge: names the byte count so it can be judged',
+  realChallenge.summary.crawlErrors.some(e => /bytes/.test(e)),
+  JSON.stringify(realChallenge.summary.crawlErrors));
 ok('real challenge: tells the user the remedy',
   realChallenge.summary.crawlErrors.some(e => /premiumProxy/.test(e)));
+eq('real challenge: every slice reported, run not abandoned',
+  realChallenge.summary.crawlErrors.filter(e => /CHALLENGE/.test(e)).length, 5);
 
 console.log('--- empty page 1 with no challenge is explained, not blamed on a block ---');
 const emptyPage1 = runWorkflow({
